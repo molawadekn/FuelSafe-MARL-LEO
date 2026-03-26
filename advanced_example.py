@@ -73,9 +73,14 @@ def demo_safety_filter_effectiveness():
     collision_reduction = (without['mean_collisions'] - with_filter['mean_collisions']) / \
                          (without['mean_collisions'] + 1e-6) * 100
     
+    fuel_delta = with_filter['mean_fuel'] - without['mean_fuel']
+    if abs(without['mean_fuel']) < 1e-6:
+        fuel_delta_pct = float('nan')
+    else:
+        fuel_delta_pct = fuel_delta / without['mean_fuel'] * 100
+
     print(f"  Collision reduction: {collision_reduction:+.1f}%")
-    print(f"  Fuel overhead: {(with_filter['mean_fuel'] - without['mean_fuel']):.2f} kg "
-          f"({((with_filter['mean_fuel'] - without['mean_fuel']) / without['mean_fuel'] * 100):.1f}%)")
+    print(f"  Fuel overhead: {fuel_delta:.2f} kg ({fuel_delta_pct:.1f}%)")
     print()
 
 
@@ -154,9 +159,9 @@ def demo_orbit_propagation():
         )
     
     # Propagate over time
-    from datetime import datetime, timedelta
-    
-    start_time = datetime.utcnow()
+    from datetime import datetime, timedelta, timezone
+
+    start_time = datetime.now(timezone.utc)
     propagation_times = [start_time + timedelta(minutes=t) for t in range(0, 100, 10)]
     
     print(f"\nPropagating {len(propagator.satellites)} satellites for {len(propagation_times)} timesteps...")
@@ -206,9 +211,9 @@ def demo_conjunction_detection():
     propagator.generate_sample_tle("SAT_2", semi_major_axis_km=6805, inclination_deg=51.65)
     
     # Propagate and detect
-    from datetime import datetime, timedelta
+    from datetime import datetime, timedelta, timezone
     
-    current_time = datetime.utcnow()
+    current_time = datetime.now(timezone.utc)
     detections = []
     
     print(f"\nDetecting conjunctions over 24 hours...")
@@ -248,23 +253,27 @@ def demo_conjunction_detection():
 
 
 def main():
-    """Advanced example is not part of minimal core collision avoidance code."""
-    print("Advanced example removed. Use `python main.py --demo` or `demo.py` for core collision avoidance functionality.")
+    """Run advanced demos."""
+    print("\n" + "="*70)
+    print("Running Advanced Example Demos")
+    print("="*70)
 
-
-if __name__ == '__main__':
-    main()
+    demos = [
+        ("Safety Filter Effectiveness", demo_safety_filter_effectiveness),
+        ("Scalability Analysis", demo_scalability),
+        ("Orbit Propagation", demo_orbit_propagation),
         ("Conjunction Detection", demo_conjunction_detection),
     ]
-    
+
     for i, (name, demo_func) in enumerate(demos, 1):
+        print(f"\n--- {i}/{len(demos)} {name} ---")
         try:
             demo_func()
         except Exception as e:
             print(f"\n✗ Error in {name}: {e}")
             import traceback
             traceback.print_exc()
-    
+
     print("\n" + "="*70)
     print("All demonstrations completed!")
     print("="*70 + "\n")
@@ -272,134 +281,3 @@ if __name__ == '__main__':
 
 if __name__ == '__main__':
     main()
-
-
-    def _handle_coordination_request(self, message: Dict[str, Any]) -> None:
-        """Handle coordination requests from satellites."""
-        payload = message.get("payload", {})
-        satellite_id = message.get("sender_id")
-        
-        # Coordinate with other satellites
-        print(f"  [COORD] {self.name} coordinating for {satellite_id}")
-        
-        # Inform all other satellites about the issue
-        for peer_id in self.peers:
-            if peer_id != satellite_id:
-                self.send_message(
-                    peer_id,
-                    "COORDINATION_ALERT",
-                    {
-                        "affected_satellite": satellite_id,
-                        "issue_description": payload.get("issue")
-                    }
-                )
-
-    def _respond_to_heartbeat(self, message: Dict[str, Any]) -> None:
-        """Respond to health monitor heartbeat."""
-        self.send_message(
-            message.get("sender_id"),
-            "HEARTBEAT_RESPONSE",
-            {
-                "agent_id": self.agent_id,
-                "is_alive": self.is_alive,
-                "health_status": self.health_status.value,
-                "coordination_level": self.coordination_level
-            }
-        )
-
-    def execute_routine(self) -> None:
-        """Execute controller routine."""
-        self.process_messages()
-        
-        # Check if coordination is needed
-        unhealthy_count = sum(
-            1 for agent in self.peers.values()
-            if agent.health_status in [HealthStatus.UNHEALTHY, HealthStatus.DEGRADED]
-        )
-        
-        if unhealthy_count > 1:
-            print(f"  [WARN] {self.name} detected {unhealthy_count} struggling agents, increasing coordination")
-            self.coordination_level = min(2.0, self.coordination_level + 0.2)
-        else:
-            self.coordination_level = max(1.0, self.coordination_level - 0.1)
-
-
-class ResilientSatelliteAgent(SatelliteAgent):
-    """
-    Enhanced satellite agent with additional resilience features.
-    Can temporarily boost performance if needed.
-    """
-
-    def __init__(self, agent_id: str, name: str):
-        super().__init__(agent_id, name)
-        self.boost_active = False
-        self.boost_duration = 0
-
-    def execute_routine(self) -> None:
-        """Execute enhanced routine with boost capability."""
-        super().execute_routine()
-        
-        # Check if boost is active
-        if self.boost_active:
-            self.boost_duration -= 1
-            if self.boost_duration <= 0:
-                self.boost_active = False
-                print(f"  ⚡ {self.name} boost deactivated")
-            else:
-                # Boost reduces degradation
-                self.degrade_performance(1.0)
-
-    def activate_emergency_boost(self, duration: int = 3) -> None:
-        """
-        Activate performance boost for emergency situations.
-        
-        Args:
-            duration: Number of cycles to maintain boost
-        """
-        if not self.boost_active:
-            self.boost_active = True
-            self.boost_duration = duration
-            print(f"  ⚡ {self.name} activated emergency boost!")
-
-
-def run_advanced_simulation():
-    """Run an advanced simulation with mixed agent types."""
-    
-    print("=" * 70)
-    print("[ADVANCED AGENTIC AI SIMULATION]")
-    print("=" * 70)
-    
-    # Create orchestrator
-    orchestrator = AgentOrchestrator("Advanced Multi-Agent System")
-    
-    # Create standard satellites
-    satellite1 = SatelliteAgent(str(uuid.uuid4())[:8], "Satellite-Standard-1")
-    satellite2 = SatelliteAgent(str(uuid.uuid4())[:8], "Satellite-Standard-2")
-    
-    # Create resilient satellites
-    satellite3 = ResilientSatelliteAgent(str(uuid.uuid4())[:8], "Satellite-Resilient-1")
-    satellite4 = ResilientSatelliteAgent(str(uuid.uuid4())[:8], "Satellite-Resilient-2")
-    
-    # Create controller agent
-    controller = ControllerAgent(str(uuid.uuid4())[:8], "Controller-1")
-    
-    # Create health monitor
-    monitor = HealthMonitorAgent(str(uuid.uuid4())[:8], "Monitor-1")
-    
-    # Register all agents
-    orchestrator.register_agent(satellite1)
-    orchestrator.register_agent(satellite2)
-    orchestrator.register_agent(satellite3)
-    orchestrator.register_agent(satellite4)
-    orchestrator.register_agent(controller)
-    orchestrator.register_agent(monitor)
-    
-    # Setup network
-    orchestrator.setup_agent_network()
-    
-    # Run simulation
-    orchestrator.run_simulation(max_iterations=20)
-
-
-if __name__ == "__main__":
-    run_advanced_simulation()

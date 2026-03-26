@@ -41,7 +41,7 @@ The system comprises **12 integrated modules**:
 | 8 | Policy Interface | `policies/policy_interface.py` |
 | 9 | Simulation Loop | `sim/simulator.py` |
 | 10 | Experiment Framework | `experiments/experiment_runner.py` |
-| 11 | Working Demo | `demo.py` |
+| 11 | Test-Case Framework | `experiments/run_collision_avoidance_tests.py` |
 | 12 | Main Entry Point | `main.py` |
 
 ## 🚀 Quick Start
@@ -49,8 +49,8 @@ The system comprises **12 integrated modules**:
 ### Installation
 
 ```bash
-# Clone repository
-cd Agentic_AI_POC
+# Open repository
+cd "FuelSafe-MARL-LEO"
 
 # Create virtual environment
 python -m venv env
@@ -66,17 +66,11 @@ pip install -r requirements.txt
 # Quick demo (baseline vs rule-based policies, 3 satellites, 5 debris)
 python main.py --demo
 
-# Full experiment (scalability testing)
-python main.py --experiment
-
-# Compare all policies
-python main.py --compare
-
-# Train MARL policy
-python main.py --train-marl
-
 # Advanced examples (safety filter, scalability, orbit propagation)
 python advanced_example.py
+
+# Reproducible test-case framework
+python experiments/run_collision_avoidance_tests.py --quick --mc-runs 3 --max-debris 200
 ```
 
 ## 📦 Dependencies
@@ -238,7 +232,7 @@ runner.print_report()
 ## 📁 Project Structure
 
 ```
-Agentic_AI_POC/
+FuelSafe-MARL-LEO/
 ├── sim/                          # Simulation modules
 │   ├── orbit_propagator.py      # SGP4 orbit propagation
 │   ├── cdm_loader.py            # ESA CDM data ingestion
@@ -254,13 +248,12 @@ Agentic_AI_POC/
 ├── safety/                       # Safety verification
 │   └── cbf_filter.py            # Control Barrier Function filter
 ├── experiments/                  # Experiment framework
-│   └── experiment_runner.py     # Multi-config experiment orchestrator
+│   ├── experiment_runner.py     # Multi-config experiment orchestrator
+│   └── run_collision_avoidance_tests.py  # Reproducible test-case runner
 ├── data/                         # Data storage (CDM, TLE, etc.)
 ├── outputs/                      # Results and logs
 ├── main.py                       # Main entry point
-├── demo.py                       # Quick demonstration
 ├── advanced_example.py           # Advanced features showcase
-├── config.py                     # Configuration
 ├── requirements.txt              # Python dependencies
 └── README.md                     # This file
 ```
@@ -278,22 +271,12 @@ Output shows:
 - Collision and fuel metrics
 - Winner determination
 
-### Train MARL Model
+### Run Reproducible Test Cases
 ```bash
-python main.py --train-marl
+python experiments/run_collision_avoidance_tests.py --mc-runs 30 --max-debris 500
 ```
 
-Trains on small scenario (3 satellites, 5 debris) for demonstration.
-
-### Run Full Experiment
-```bash
-python main.py --experiment
-```
-
-Tests multiple configurations:
-- Satellites: [3, 10]
-- Debris: [5, 50]
-- Policies: [baseline, rule_based]
+This produces per-run and aggregated CSV outputs under `outputs/test_framework*/`.
 
 ### Advanced Examples
 ```bash
@@ -453,7 +436,7 @@ MIT License - Use freely for research and education
 ## 📞 Support
 
 For issues or questions:
-1. Check existing examples in `demo.py` and `advanced_example.py`
+1. Check existing examples in `main.py` and `advanced_example.py`
 2. Review docstrings in module files
 3. Enable verbose logging for debugging
 4. Check `outputs/` directory for detailed simulation logs
