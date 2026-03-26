@@ -1,0 +1,3 @@
+test_case,policy,mean_fuel,mean_collisions
+TC7_secondary_conjunctions,no_op,0.0,356.0
+TC7_secondary_conjunctions,rule_based,0.0,356.0

@@ -58,6 +58,10 @@ def run_demo():
         aggregated = runner._aggregate_stats(stats_list)
         results[policy_type] = aggregated
 
+        # Save per-policy log
+        if runner.logger:
+            runner.logger.save_to_csv(f'{policy_type}_simulation_log.csv')
+
         print(f"\nResults for {policy_type}:")
         print(f"  Mean Collisions: {aggregated['mean_collisions']:.2f}")
         print(f"  Mean Fuel Used: {aggregated['mean_fuel']:.2f} kg")

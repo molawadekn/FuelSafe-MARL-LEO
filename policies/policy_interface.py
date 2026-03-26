@@ -245,6 +245,113 @@ class RuleBasedPolicy(BasePolicy):
         self.maneuver_history = {}
 
 
+class NoOpPolicy(BasePolicy):
+    """Worst-case policy: always choose NO_OP."""
+
+    def select_action(self, state: np.ndarray, agent_id: str) -> int:
+        return 0
+
+    def reset(self):
+        pass
+
+
+class ThresholdRulePolicy(BasePolicy):
+    """
+    Simple threshold-based deterministic rule.
+
+    If any nearby object is within `threshold_km`, execute `dv_action`
+    (e.g., PROGRADE) else NO_OP.
+    """
+
+    def __init__(self, threshold_km: float = 5.0, dv_action: int = 1):
+        self.threshold_km = float(threshold_km)
+        self.dv_action = int(dv_action)
+
+    def select_action(self, state: np.ndarray, agent_id: str) -> int:
+        if len(state) < 10:
+            return 0
+
+        own_pos = state[:3]
+
+        nearby_start = 8
+        min_distance = float("inf")
+
+        for i in range(7):
+            obj_start = nearby_start + i * 6
+            if obj_start + 6 > len(state):
+                break
+
+            obj_pos = state[obj_start : obj_start + 3]
+            obj_vel = state[obj_start + 3 : obj_start + 6]
+
+            # Empty slots are encoded as zeros.
+            if np.allclose(obj_pos, 0) and np.allclose(obj_vel, 0):
+                continue
+
+            dist = np.linalg.norm(obj_pos - own_pos)
+            if dist < min_distance:
+                min_distance = dist
+
+        if min_distance < self.threshold_km:
+            return self.dv_action
+        return 0
+
+    def reset(self):
+        pass
+
+
+class FuelAwareThresholdRulePolicy(BasePolicy):
+    """
+    Distance-threshold rule gated by minimum remaining fuel.
+    """
+
+    def __init__(
+        self,
+        threshold_km: float = 5.0,
+        dv_action: int = 1,
+        min_fuel_ratio: float = 0.1,
+    ):
+        self.threshold_km = float(threshold_km)
+        self.dv_action = int(dv_action)
+        self.min_fuel_ratio = float(min_fuel_ratio)
+
+    def select_action(self, state: np.ndarray, agent_id: str) -> int:
+        if len(state) < 10:
+            return 0
+
+        own_pos = state[:3]
+        fuel_ratio = float(state[6])
+
+        # Conserve fuel if below threshold.
+        if fuel_ratio <= self.min_fuel_ratio:
+            return 0
+
+        nearby_start = 8
+        min_distance = float("inf")
+
+        for i in range(7):
+            obj_start = nearby_start + i * 6
+            if obj_start + 6 > len(state):
+                break
+
+            obj_pos = state[obj_start : obj_start + 3]
+            obj_vel = state[obj_start + 3 : obj_start + 6]
+
+            if np.allclose(obj_pos, 0) and np.allclose(obj_vel, 0):
+                continue
+
+            dist = np.linalg.norm(obj_pos - own_pos)
+            if dist < min_distance:
+                min_distance = dist
+
+        if min_distance < self.threshold_km:
+            return self.dv_action
+        return 0
+
+    def reset(self):
+        pass
+
+
 class MARLPolicy(BasePolicy):
     """
     MARL policy wrapper (uses trained MARL model).

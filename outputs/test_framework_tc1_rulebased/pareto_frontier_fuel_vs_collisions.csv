@@ -1,0 +1,5 @@
+test_case,policy,mean_fuel,mean_collisions
+TC1_no_maneuver,fuel_aware_threshold_rule,0.14999999999800107,1228.0
+TC1_no_maneuver,no_op,0.0,1378.0
+TC1_no_maneuver,rule_based,0.0,1378.0
+TC1_no_maneuver,threshold_rule,0.14999999999800107,1228.0

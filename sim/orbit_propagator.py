@@ -3,9 +3,10 @@ MODULE 1: Orbit Propagation Engine (SGP4)
 Propagates satellite and debris orbits using SGP4 model.
 """
 
+import hashlib
 import numpy as np
 from dataclasses import dataclass
-from typing import Tuple, Dict, List
+from typing import Tuple, Dict, List, Optional
 from datetime import datetime, timedelta
 from sgp4.api import Satrec
 
@@ -143,10 +144,11 @@ class OrbitPropagator:
         rel_vel = obj2_state.velocity - obj1_state.velocity
         return rel_pos, rel_vel
     
-    def generate_sample_tle(self, object_id: str, 
+    def generate_sample_tle(self, object_id: str,
                            semi_major_axis_km: float = 6800,
                            inclination_deg: float = 51.6,
-                           eccentricity: float = 0.0001) -> None:
+                           eccentricity: float = 0.0001,
+                           epoch_datetime: Optional[datetime] = None) -> None:
         """
         Generate a sample TLE for testing (circular orbit).
         
@@ -155,16 +157,17 @@ class OrbitPropagator:
             semi_major_axis_km: Semi-major axis in km
             inclination_deg: Inclination in degrees
             eccentricity: Eccentricity
+            epoch_datetime: Fixed epoch to keep scenarios reproducible
         """
         # Create a simplified TLE (note: proper TLE generation is complex)
         # This creates a basic LEO TLE
         anomaly_motion = self._compute_mean_motion(semi_major_axis_km)
         
-        # Generate unique satellite number (use hash of object_id for uniqueness)
-        satnum = abs(hash(object_id)) % 99999 + 1  # 1-99999
-        
-        # Current epoch (year and day of year)
-        now = datetime.utcnow()
+        # Generate deterministic satellite number (Python hash is randomized per-process)
+        satnum = self._stable_satnum(object_id)
+
+        # Current epoch (year and day of year) - overridden for reproducibility.
+        now = epoch_datetime or datetime.utcnow()
         year = now.year % 100  # Last two digits
         day_of_year = now.timetuple().tm_yday
         epoch = f"{year:02d}{day_of_year:03d}.00000000"
@@ -177,6 +180,13 @@ class OrbitPropagator:
         line2 = f"2 {satnum:05d} {inclination_deg:8.4f} {0.0:8.4f} {ecc_field} {0.0:8.4f} {0.0:8.4f} {anomaly_motion:11.8f} {0:5d}"
         
         self.load_tle(object_id, line1, line2)
+
+    @staticmethod
+    def _stable_satnum(object_id: str) -> int:
+        """Deterministic satnum derived from object_id."""
+        digest = hashlib.sha256(object_id.encode("utf-8")).hexdigest()
+        # 1..99999 (fits the simplified satnum formatting used above)
+        return int(digest[:8], 16) % 99999 + 1
     
     @staticmethod
     def _compute_mean_motion(semi_major_axis_km: float) -> float:

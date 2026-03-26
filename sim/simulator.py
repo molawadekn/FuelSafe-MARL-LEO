@@ -12,7 +12,15 @@ from pathlib import Path
 
 from env.ma_env import MultiAgentOrbitalEnv
 from safety.cbf_filter import CBFSafetyFilter
-from policies.policy_interface import PolicyManager, BaselinePolicy, RuleBasedPolicy
+from policies.policy_interface import (
+    PolicyManager,
+    BaselinePolicy,
+    RuleBasedPolicy,
+    NoOpPolicy,
+    ThresholdRulePolicy,
+    FuelAwareThresholdRulePolicy,
+    MARLPolicy,
+)
 
 
 class SimulationLogger:
@@ -93,7 +101,16 @@ class SimulationRunner:
                  collision_threshold_km: float = 1.0,
                  high_risk_mode: bool = False,
                  policy_type: str = 'baseline',
-                 enable_logging: bool = True):
+                 enable_logging: bool = True,
+                 dt_sec: float = 60.0,
+                 orbit_altitude_km: float = 600.0,
+                 epoch_datetime: Optional[datetime] = None,
+                 initial_fuel_kg: float = 1000.0,
+                 max_fuel_kg: float = 1000.0,
+                 near_miss_distance_km: Optional[float] = None,
+                 secondary_conjunction_risk_threshold: float = 0.5,
+                 policy_kwargs: Optional[Dict] = None,
+                 marl_trainer: Optional[object] = None):
         """
         Initialize simulation runner.
         
@@ -108,6 +125,8 @@ class SimulationRunner:
         self.num_satellites = num_satellites
         self.num_debris = num_debris
         self.policy_type = policy_type
+        self.policy_kwargs = policy_kwargs or {}
+        self.marl_trainer = marl_trainer
         
         # Environment
         self.env = MultiAgentOrbitalEnv(
@@ -115,7 +134,14 @@ class SimulationRunner:
             num_debris=num_debris,
             distance_threshold_km=distance_threshold_km,
             collision_threshold_km=collision_threshold_km,
-            high_risk_mode=high_risk_mode
+            high_risk_mode=high_risk_mode,
+            dt=dt_sec,
+            initial_fuel_kg=initial_fuel_kg,
+            max_fuel_kg=max_fuel_kg,
+            epoch_datetime=epoch_datetime,
+            orbit_altitude_km=orbit_altitude_km,
+            near_miss_distance_km=near_miss_distance_km,
+            secondary_conjunction_risk_threshold=secondary_conjunction_risk_threshold,
         )
         
         # Safety filter
@@ -136,9 +162,35 @@ class SimulationRunner:
     
     def _setup_policies(self) -> None:
         """Setup available policies."""
-        self.policy_manager.register_policy('baseline', BaselinePolicy())
-        self.policy_manager.register_policy('rule_based', RuleBasedPolicy())
-        # MARL policy would be added when trainer is ready
+        self.policy_manager.register_policy(
+            'baseline',
+            BaselinePolicy(risk_threshold=float(self.policy_kwargs.get('baseline_risk_threshold', 0.5))),
+        )
+        self.policy_manager.register_policy(
+            'rule_based',
+            RuleBasedPolicy(aggression=float(self.policy_kwargs.get('rule_based_aggression', 0.5))),
+        )
+
+        # Deterministic policies for worst-case and threshold-based tests.
+        self.policy_manager.register_policy('no_op', NoOpPolicy())
+        self.policy_manager.register_policy(
+            'threshold_rule',
+            ThresholdRulePolicy(
+                threshold_km=float(self.policy_kwargs.get('threshold_km', 5.0)),
+                dv_action=int(self.policy_kwargs.get('dv_action', 1)),
+            ),
+        )
+        self.policy_manager.register_policy(
+            'fuel_aware_threshold_rule',
+            FuelAwareThresholdRulePolicy(
+                threshold_km=float(self.policy_kwargs.get('threshold_km', 5.0)),
+                dv_action=int(self.policy_kwargs.get('dv_action', 1)),
+                min_fuel_ratio=float(self.policy_kwargs.get('min_fuel_ratio', 0.1)),
+            ),
+        )
+
+        if self.marl_trainer is not None:
+            self.policy_manager.register_policy('marl', MARLPolicy(self.marl_trainer))
     
     def run_episode(self, max_steps: int = 1000,
                    verbose: bool = True) -> Dict:
@@ -159,7 +211,10 @@ class SimulationRunner:
             'total_collisions': 0,
             'total_fuel_used': 0.0,
             'total_alerts': 0,
-            'total_maneuvers': 0,
+            'total_maneuvers_executed': 0,
+            'total_secondary_conjunctions': 0,
+            'total_near_misses': 0,
+            'min_separation_distance_km': float("inf"),
             'final_step': 0,
         }
         
@@ -192,9 +247,10 @@ class SimulationRunner:
             episode_stats['total_collisions'] = info['episode_collisions']
             episode_stats['total_fuel_used'] = self.env.episode_fuel_used
             episode_stats['total_alerts'] += info['alerts_count']
-            episode_stats['total_maneuvers'] += sum(
-                1 for a in actions.values() if a != 0
-            )
+            episode_stats['total_maneuvers_executed'] = self.env.episode_maneuvers_executed
+            episode_stats['total_secondary_conjunctions'] = self.env.episode_secondary_conjunctions
+            episode_stats['total_near_misses'] = self.env.episode_near_misses
+            episode_stats['min_separation_distance_km'] = self.env.episode_min_separation_distance_km
             
             # Update observations
             observations = next_obs
@@ -336,12 +392,16 @@ class SimulationRunner:
         
         collisions = [s['total_collisions'] for s in stats_list]
         fuel = [s['total_fuel_used'] for s in stats_list]
+        maneuvers = [s.get('total_maneuvers_executed', 0) for s in stats_list]
+        secondary = [s.get('total_secondary_conjunctions', 0) for s in stats_list]
         
         return {
             'mean_collisions': np.mean(collisions),
             'std_collisions': np.std(collisions),
             'mean_fuel': np.mean(fuel),
             'std_fuel': np.std(fuel),
+            'mean_maneuvers_executed': np.mean(maneuvers),
+            'mean_secondary_conjunctions': np.mean(secondary),
             'success_rate': np.mean([1 if c == 0 else 0 for c in collisions]),
             'avg_episode_length': np.mean([s['final_step'] for s in stats_list]),
         }
