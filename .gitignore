@@ -71,3 +71,11 @@ logs/
 # Temporary files
 *.tmp
 *.temp
+
+# Local datasets
+data/*.csv
+!data/README.md
+
+# Generated outputs
+outputs/*
+!outputs/README.md

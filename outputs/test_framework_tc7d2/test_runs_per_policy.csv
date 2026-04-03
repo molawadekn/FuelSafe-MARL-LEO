@@ -1,5 +1,0 @@
-mc_idx,orbit_altitude_km,epoch_datetime,total_collisions,total_fuel_used,total_alerts,total_maneuvers_executed,total_secondary_conjunctions,total_near_misses,min_separation_distance_km,final_step,test_case,policy,policy_label
-0,708.9407556793585,2020-01-01T00:00:00,356,0.0,1378,0,0,309,0.43486307243736283,0,TC7_secondary_conjunctions,no_op,No maneuver (no_op)
-0,708.9407556793585,2020-01-01T00:00:00,356,0.0,1378,0,0,309,0.43486307243736283,0,TC7_secondary_conjunctions,rule_based,Rule-based (existing TCA logic)
-0,708.9407556793585,2020-01-01T00:00:00,356,0.14999999999800076,1228,3,307,307,0.43486307243736283,0,TC7_secondary_conjunctions,threshold_rule,Threshold rule
-0,708.9407556793585,2020-01-01T00:00:00,356,0.14999999999800076,1228,3,307,307,0.43486307243736283,0,TC7_secondary_conjunctions,fuel_aware_threshold_rule,Fuel-aware threshold rule

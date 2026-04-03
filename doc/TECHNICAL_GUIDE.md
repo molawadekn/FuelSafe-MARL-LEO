@@ -1,64 +1,109 @@
 # Technical Guide - FuelSafe-MARL-LEO
 
-## Architecture (current codebase)
+## Runtime Architecture
 
-### Core runtime flow
+1. `sim/orbit_propagator.py`
+   Generates reference orbital states with SGP4.
+2. `env/ma_env.py`
+   Maintains actual agent state, applies persistent maneuver offsets, computes rewards, and exposes observations.
+3. `sim/conjunction_detector.py`
+   Scores pairwise encounters and labels collisions.
+4. `sim/maneuver_engine.py`
+   Converts discrete actions into `delta-v` burns and fuel use.
+5. `marl/marl_trainer.py`
+   Trains a MAPPO-style policy with:
+   - per-agent actors
+   - a centralized critic over concatenated observations
+   - stored action log-probs
+   - GAE-style returns
+6. `policies/policy_interface.py`
+   Exposes both per-agent and joint-action policy APIs.
+7. `sim/simulator.py`
+   Runs episodes, applies the CBF filter, and aggregates metrics.
+8. `sim/reporting.py`
+   Builds interactive Plotly charts for summaries, raw runs, and training progress.
 
-1. `OrbitPropagator` generates and propagates object states (`sim/orbit_propagator.py`)
-2. `MultiAgentOrbitalEnv.step()`:
-   - propagates objects
-   - applies satellite maneuvers
-   - detects conjunctions/collisions
-   - updates rewards and episode metrics
-3. `SimulationRunner`:
-   - gets actions from selected policy
-   - optionally filters actions through CBF
-   - logs and aggregates run statistics
+## Observation and Action Spaces
 
-## Main components
+Observation size: `64`
 
-- `sim/orbit_propagator.py`: SGP4 state propagation and sample TLE creation
-- `sim/conjunction_detector.py`: pairwise distance, risk score, collision labeling
-- `sim/maneuver_engine.py`: discrete action to ΔV, fuel consumption
-- `env/ma_env.py`: environment state, step logic, rewards, episode metrics
-- `safety/cbf_filter.py`: action safety projection
-- `policies/policy_interface.py`: policy abstractions and implementations
-- `sim/simulator.py`: policy execution loop, CBF integration, aggregation
-- `experiments/run_collision_avoidance_tests.py`: reproducible test-case framework
+Layout:
+- own position: 3
+- own velocity: 3
+- fuel ratio: 1
+- normalized step count: 1
+- up to 7 nearby objects:
+  each contributes 8 values
+  `position(3) + velocity(3) + miss_distance_norm + tca_norm`
 
-## Policies
+Action space: `Discrete(6)`
+- `0`: `NO_OP`
+- `1`: `PROGRADE`
+- `2`: `RETROGRADE`
+- `3`: `RADIAL_OUT`
+- `4`: `RADIAL_IN`
+- `5`: `NORMAL`
 
-Implemented policy keys:
-- `no_op`
-- `baseline`
-- `rule_based`
-- `threshold_rule`
-- `fuel_aware_threshold_rule`
-- `marl` (optional wrapper, requires trainer/model injection)
+## Reward Model
 
-## Metrics tracked in framework
+The default reward combines:
+- collision penalty
+- actual fuel burned that step
+- safe-separation reward when the agent is not in a high-risk alert
+- secondary conjunction penalty when close non-collision alerts appear after maneuver activity
 
-- `total_collisions`
-- `total_fuel_used`
-- `total_maneuvers_executed`
-- `total_secondary_conjunctions`
-- `total_near_misses`
-- `min_separation_distance_km`
+Default weights in `env/ma_env.py`:
 
-## Reproducibility and fairness
-
-- Fixed epoch support in scenario generation
-- Stable object ID to satnum mapping for deterministic sample TLE generation
-- Same scenario setup reused across policy variants per Monte Carlo index
-
-## Running technical evaluations
-
-```bash
-# quick validation
-python experiments/run_collision_avoidance_tests.py --quick --mc-runs 3 --max-debris 200
-
-# full Monte Carlo with significance outputs
-python experiments/run_collision_avoidance_tests.py --mc-runs 50 --max-debris 500
+```python
+{
+    "collision": -10000.0,
+    "fuel": -1.0,
+    "safe_separation": 1.0,
+    "secondary_conjunction": -100.0,
+}
 ```
 
-When `--mc-runs >= 2`, t-test outputs are generated automatically if SciPy is available.
+## Termination Conditions
+
+Episodes end when one of the following happens:
+- collisions in the episode reach 5
+- step count reaches 1000
+- all satellites are out of fuel
+
+## Dataset-Driven Scenarios
+
+`sim/csv_data_loader.py` extracts:
+- target orbital elements
+- chaser orbital elements
+- relative position and velocity features
+- conjunction metadata such as miss distance, relative speed, and time to TCA
+
+`sim/dataset_integration.py` passes those features into the environment so the first satellite-debris pair is initialized from dataset-derived geometry instead of a generic placeholder configuration.
+
+The same module now exposes a train/validate CLI that:
+- trains MARL on `data/train_data.csv`
+- selects risk-stratified unique conjunction events instead of only the top few worst rows
+- uses a tighter `0.5 km` collision threshold for CDM-driven train/validate runs
+- saves weights and per-episode training metrics
+- evaluates `no_op`, `fuel_aware_threshold_rule`, `rule_based`, and `marl` on `data/test_data.csv`
+- writes summary artifacts under `outputs/marl_train_validation/`
+- writes interactive HTML charts for validation and training progress
+
+## Local UI
+
+`ui/streamlit_app.py` provides a local UI for:
+- demos
+- dataset experiments
+- dataset train/validate runs
+- named test cases `TC1` through `TC8`
+- chart-based result exploration from generated output directories
+
+## Fuel-Constrained MARL Evaluation
+
+`experiments/run_collision_avoidance_tests.py` now supports `marl` in:
+- `TC4_marl`
+- `TC5_high_density_stress`
+- `TC6_fuel_constrained`
+- `TC7_secondary_conjunctions`
+
+That means the dedicated low-fuel scenario can now compare MARL against the deterministic baselines directly.

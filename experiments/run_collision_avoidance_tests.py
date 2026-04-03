@@ -3,6 +3,7 @@ Collision Avoidance Test-Case Framework
 -----------------------------------------
 Runs reproducible Monte Carlo evaluations for:
   - worst-case no-maneuver (no_op)
+  - baseline heuristic policy (baseline)
   - deterministic threshold rules (threshold_rule)
   - fuel-aware threshold rules (fuel_aware_threshold_rule)
   - optional MARL evaluation (if enabled)
@@ -31,6 +32,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from sim.simulator import SimulationRunner
+from sim.reporting import save_run_distribution_charts, save_summary_charts
 
 try:
     from scipy import stats as scipy_stats
@@ -64,6 +66,7 @@ class ScenarioSpec:
     orbit_altitude_band_km: tuple[float, float]
     use_high_risk_mode: bool
     policy_params: Dict[str, Any]
+    scenario_config: Optional[Dict[str, Any]] = None
     # Simulation / metrics
     distance_threshold_km: float = 250.0
     collision_threshold_km: float = 5.0
@@ -160,6 +163,45 @@ def build_test_cases(
             collision_threshold_km=5.0,
             distance_threshold_km=100.0,
         ),
+        # TC8: synthetic high-collision pressure scenario with a close first-pair encounter.
+        "TC8_hypothetical_collision_cluster": ScenarioSpec(
+            test_case="TC8_hypothetical_collision_cluster",
+            num_satellites=3,
+            num_debris=cap(1),
+            orbit_altitude_band_km=(low, high),
+            use_high_risk_mode=False,
+            policy_params={
+                "fuel_kg": 0.5,
+                "threshold_km": 5.0,
+                "dv_action": 1,
+                "min_fuel_ratio": 0.2,
+                "baseline_risk_threshold": 0.5,
+                "rule_based_aggression": 0.9,
+            },
+            scenario_config={
+                "name": "Synthetic_Close_Cluster",
+                "duration_hours": 1.0,
+                "risk_level": "HIGH",
+                "target_features": {"sma": 6978.0, "ecc": 0.0001, "inc": 51.6},
+                "chaser_features": {"sma": 6978.001, "ecc": 0.0001, "inc": 51.6},
+                "conjunction_info": {
+                    "miss_distance": 200.0,
+                    "relative_speed": 13000.0,
+                    "time_to_tca": 0.05,
+                    "risk_score": -1.0,
+                },
+                "raw_features": {
+                    "relative_position_r": 50.0,
+                    "relative_position_t": 150.0,
+                    "relative_position_n": 10.0,
+                    "relative_velocity_r": -5.0,
+                    "relative_velocity_t": -20.0,
+                    "relative_velocity_n": 0.0,
+                },
+            },
+            collision_threshold_km=1.2,
+            distance_threshold_km=20.0,
+        ),
     }
 
 
@@ -201,13 +243,14 @@ def run_policy_on_scenario(
         initial_fuel_kg=fuel_kg,
         max_fuel_kg=fuel_kg,
         secondary_conjunction_risk_threshold=0.3,
+        scenario_config=scenario.scenario_config,
         policy_kwargs={
             # Defaults for policies that accept/ignore these.
             "threshold_km": scenario.policy_params.get("threshold_km", scenario.collision_threshold_km),
             "dv_action": scenario.policy_params.get("dv_action", 1),
             "min_fuel_ratio": scenario.policy_params.get("min_fuel_ratio", 0.1),
-            "baseline_risk_threshold": 0.5,
-            "rule_based_aggression": 0.5,
+            "baseline_risk_threshold": scenario.policy_params.get("baseline_risk_threshold", 0.5),
+            "rule_based_aggression": scenario.policy_params.get("rule_based_aggression", 0.5),
         },
     )
 
@@ -256,6 +299,7 @@ def main() -> None:
     # Policy set. TC4 will add MARL only if enabled.
     base_policies = [
         ("no_op", "No maneuver (no_op)"),
+        ("baseline", "Baseline heuristic"),
         ("rule_based", "Rule-based (existing TCA logic)"),
         ("threshold_rule", "Threshold rule"),
         ("fuel_aware_threshold_rule", "Fuel-aware threshold rule"),
@@ -278,7 +322,14 @@ def main() -> None:
 
         # Optional MARL trainer: create one per satellite count.
         marl_trainer = None
-        include_marl_here = args.include_marl and tc_key == "TC4_marl" or (args.include_marl and tc_key in ("TC5_high_density_stress", "TC7_secondary_conjunctions"))
+        marl_enabled_cases = {
+            "TC4_marl",
+            "TC5_high_density_stress",
+            "TC6_fuel_constrained",
+            "TC7_secondary_conjunctions",
+            "TC8_hypothetical_collision_cluster",
+        }
+        include_marl_here = bool(args.include_marl and tc_key in marl_enabled_cases)
         if include_marl_here:
             from marl.marl_trainer import MARLTrainer
 
@@ -334,6 +385,7 @@ def main() -> None:
     summary = (
         df.groupby(["test_case", "policy"], dropna=False)
         .agg(
+            policy_label=("policy_label", "first"),
             mean_collisions=("total_collisions", "mean"),
             std_collisions=("total_collisions", "std"),
             mean_fuel=("total_fuel_used", "mean"),
@@ -341,6 +393,7 @@ def main() -> None:
             mean_maneuvers=("total_maneuvers_executed", "mean"),
             mean_secondary_conjunctions=("total_secondary_conjunctions", "mean"),
             mean_near_misses=("total_near_misses", "mean"),
+            mean_min_separation_km=("min_separation_distance_km", "mean"),
         )
         .reset_index()
     )
@@ -353,6 +406,8 @@ def main() -> None:
         ttest_rows: List[Dict[str, Any]] = []
         policy_pairs = [
             ("no_op", "rule_based"),
+            ("no_op", "baseline"),
+            ("baseline", "rule_based"),
             ("no_op", "threshold_rule"),
             ("threshold_rule", "fuel_aware_threshold_rule"),
         ]
@@ -445,15 +500,24 @@ def main() -> None:
         for tc_key in df["test_case"].unique():
             sub = summary[summary["test_case"] == tc_key]
             # Plot in stable order
-            order = ["no_op", "rule_based", "threshold_rule", "fuel_aware_threshold_rule", "marl"]
+            order = ["no_op", "baseline", "rule_based", "threshold_rule", "fuel_aware_threshold_rule", "marl"]
             sub = sub.set_index("policy").reindex(order).reset_index()
-            plt.plot(sub["policy_label"] if "policy_label" in sub.columns else sub["policy"], sub[metric], marker="o")
+            sub = sub[sub[metric].notna()].copy()
+            if "policy_label" in sub.columns:
+                sub["policy_label"] = sub["policy_label"].fillna(sub["policy"])
+                x_values = sub["policy_label"]
+            else:
+                x_values = sub["policy"]
+            plt.plot(x_values, sub[metric], marker="o")
         plt.title(f"{metric} by policy (per test case)")
         plt.ylabel(ylabel)
         plt.tight_layout()
         plot_path = out_dir / f"plot_{metric}.png"
         plt.savefig(plot_path)
         plt.close()
+
+    save_summary_charts(summary, out_dir, prefix="interactive_summary")
+    save_run_distribution_charts(df, out_dir, prefix="interactive_runs")
 
     print("Finished test framework run.")
 

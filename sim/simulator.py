@@ -6,7 +6,7 @@ maneuvers, reward computation, and logging.
 
 import numpy as np
 import pandas as pd
-from typing import Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime
 from pathlib import Path
 
@@ -36,6 +36,14 @@ class SimulationLogger:
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(exist_ok=True)
         
+        self.timesteps = []
+        self.collisions = []
+        self.fuel_used = []
+        self.alerts = []
+        self.maneuvers = []
+
+    def reset(self) -> None:
+        """Clear in-memory log buffers before a fresh run."""
         self.timesteps = []
         self.collisions = []
         self.fuel_used = []
@@ -110,7 +118,8 @@ class SimulationRunner:
                  near_miss_distance_km: Optional[float] = None,
                  secondary_conjunction_risk_threshold: float = 0.5,
                  policy_kwargs: Optional[Dict] = None,
-                 marl_trainer: Optional[object] = None):
+                 marl_trainer: Optional[object] = None,
+                 scenario_config: Optional[Dict[str, Any]] = None):
         """
         Initialize simulation runner.
         
@@ -127,6 +136,7 @@ class SimulationRunner:
         self.policy_type = policy_type
         self.policy_kwargs = policy_kwargs or {}
         self.marl_trainer = marl_trainer
+        self.scenario_config = scenario_config
         
         # Environment
         self.env = MultiAgentOrbitalEnv(
@@ -142,6 +152,7 @@ class SimulationRunner:
             orbit_altitude_km=orbit_altitude_km,
             near_miss_distance_km=near_miss_distance_km,
             secondary_conjunction_risk_threshold=secondary_conjunction_risk_threshold,
+            scenario_config=scenario_config,
         )
         
         # Safety filter
@@ -219,13 +230,15 @@ class SimulationRunner:
         }
         
         for step in range(max_steps):
-            # Get actions from policy
-            actions = {}
-            for agent_id in self.env.agent_ids_ordered[:self.env.num_satellites]:
-                if agent_id in observations:
-                    actions[agent_id] = self.policy_manager.select_action(
-                        observations[agent_id], agent_id
-                    )
+            # Get joint actions from policy
+            actions = self.policy_manager.select_actions(observations)
+
+            # Keep action dict scoped to active satellite agents only.
+            actions = {
+                agent_id: int(actions.get(agent_id, 0))
+                for agent_id in self.env.agent_ids_ordered[: self.env.num_satellites]
+                if agent_id in observations
+            }
             
             # Apply safety filter if enabled
             if self.use_safety_filter:
@@ -269,10 +282,34 @@ class SimulationRunner:
                       f"Alerts: {info['alerts_count']}")
         
         return episode_stats
+
+    def run_scenario(
+        self,
+        scenario: Dict[str, Any],
+        max_steps: Optional[int] = None,
+        verbose: bool = True,
+    ) -> Dict:
+        """
+        Run a single episode using a dataset-derived scenario configuration.
+        """
+        self.scenario_config = scenario
+        self.env.set_scenario_config(scenario)
+
+        if max_steps is None:
+            duration_hours = float(scenario.get("duration_hours", 1.0))
+            max_steps = max(1, int(np.ceil(duration_hours * 3600.0 / self.env.dt)))
+
+        return self.run_episode(max_steps=max_steps, verbose=verbose)
     
-    def run_multiple_episodes(self, num_episodes: int,
-                            max_steps: int = 1000,
-                            verbose: bool = True) -> List[Dict]:
+    def run_multiple_episodes(
+        self,
+        num_episodes: int,
+        max_steps: int = 1000,
+        verbose: bool = True,
+        save_logs: bool = True,
+        log_filename: str = "simulation_log.csv",
+        maneuver_log_filename: str = "maneuvers_log.csv",
+    ) -> List[Dict]:
         """
         Run multiple episodes.
         
@@ -285,6 +322,9 @@ class SimulationRunner:
             List of episode statistics
         """
         all_stats = []
+
+        if self.logger:
+            self.logger.reset()
         
         for ep in range(num_episodes):
             if verbose:
@@ -293,10 +333,10 @@ class SimulationRunner:
             stats = self.run_episode(max_steps, verbose)
             all_stats.append(stats)
         
-        if self.logger:
+        if self.logger and save_logs:
             # Save logs for post-run visualization
-            self.logger.save_to_csv('simulation_log.csv')
-            self.logger.save_maneuvers_to_csv('maneuvers_log.csv')
+            self.logger.save_to_csv(log_filename)
+            self.logger.save_maneuvers_to_csv(maneuver_log_filename)
 
         return all_stats
     
@@ -328,8 +368,8 @@ class SimulationRunner:
             nearby_start = 8
             nearby_objects = {}
             for i in range(7):
-                obj_start = nearby_start + i * 6
-                if obj_start + 6 <= len(obs):
+                obj_start = nearby_start + i * 8
+                if obj_start + 8 <= len(obs):
                     obj_state = obs[obj_start:obj_start+6]
                     if not (np.allclose(obj_state[:3], 0) and np.allclose(obj_state[3:], 0)):
                         nearby_objects[f"OBJ_{i}"] = obj_state
@@ -346,8 +386,18 @@ class SimulationRunner:
             
             # Check if action changed
             if not np.allclose(safe_dv, action_dv):
-                # Action was modified - convert back to discrete if possible
-                filtered_actions[agent_id] = 0  # NO_OP on safety violation
+                # Action was modified - find closest valid discrete action
+                best_action = 0
+                min_dist = float('inf')
+                for a_idx in range(6):
+                    test_dv = self.env.maneuver_engine.action_index_to_delta_v(
+                        a_idx, own_state[3:]
+                    )
+                    dist = np.linalg.norm(safe_dv - test_dv)
+                    if dist < min_dist:
+                        min_dist = dist
+                        best_action = a_idx
+                filtered_actions[agent_id] = best_action
             else:
                 filtered_actions[agent_id] = action
         
@@ -373,16 +423,30 @@ class SimulationRunner:
             print(f"\n{'='*60}")
             print(f"Testing policy: {policy_name}")
             print('='*60)
-            
+
+            if policy_name not in self.policy_manager.get_available_policies():
+                print(f"Policy '{policy_name}' is not available in the policy manager. Skipping.")
+                continue
+
             self.policy_manager.use_policy(policy_name)
-            
+
+            # Reset policy state when available
+            policy = self.policy_manager.policies.get(policy_name)
+            if policy is not None and hasattr(policy, 'reset'):
+                policy.reset()
+
             stats_list = self.run_multiple_episodes(
-                num_episodes, max_steps, verbose=True
+                num_episodes,
+                max_steps,
+                verbose=True,
+                save_logs=self.logger is not None,
+                log_filename=f"{policy_name}_simulation_log.csv",
+                maneuver_log_filename=f"{policy_name}_maneuvers_log.csv",
             )
-            
+
             # Aggregate statistics
             results[policy_name] = self._aggregate_stats(stats_list)
-        
+
         return results
     
     def _aggregate_stats(self, stats_list: List[Dict]) -> Dict:
@@ -395,6 +459,9 @@ class SimulationRunner:
         maneuvers = [s.get('total_maneuvers_executed', 0) for s in stats_list]
         secondary = [s.get('total_secondary_conjunctions', 0) for s in stats_list]
         
+        collision_free = np.array([1 if c == 0 else 0 for c in collisions], dtype=float)
+        collision_light = np.array([1 if c <= 1 else 0 for c in collisions], dtype=float)
+
         return {
             'mean_collisions': np.mean(collisions),
             'std_collisions': np.std(collisions),
@@ -402,7 +469,8 @@ class SimulationRunner:
             'std_fuel': np.std(fuel),
             'mean_maneuvers_executed': np.mean(maneuvers),
             'mean_secondary_conjunctions': np.mean(secondary),
-            'success_rate': np.mean([1 if c == 0 else 0 for c in collisions]),
+            'success_rate': float(collision_free.mean()),
+            'success_rate_<=1_collision': float(collision_light.mean()),
             'avg_episode_length': np.mean([s['final_step'] for s in stats_list]),
         }
     

@@ -6,7 +6,7 @@ Enables pluggable policy comparison (baseline vs MARL).
 import numpy as np
 from abc import ABC, abstractmethod
 from enum import Enum
-from typing import Dict, Tuple
+from typing import Dict
 
 
 class PolicyType(Enum):
@@ -38,6 +38,18 @@ class BasePolicy(ABC):
     def reset(self):
         """Reset policy state."""
         pass
+
+    def select_actions(self, observations: Dict[str, np.ndarray]) -> Dict[str, int]:
+        """
+        Select actions for a full observation dict.
+
+        Policies that need joint context can override this method. The default
+        behavior preserves the existing per-agent interface.
+        """
+        return {
+            agent_id: self.select_action(state, agent_id)
+            for agent_id, state in observations.items()
+        }
     
     def name(self) -> str:
         """Return policy name."""
@@ -67,7 +79,7 @@ class BaselinePolicy(BasePolicy):
         """
         Select action using simple heuristic.
         
-        State format: [pos(3), vel(3), fuel_ratio, steps_norm, nearby_objects(42)]
+        State format: [pos(3), vel(3), fuel_ratio, steps_norm, nearby_objects(56)]
         
         Args:
             state: Observation
@@ -96,8 +108,8 @@ class BaselinePolicy(BasePolicy):
         
         # Scan nearby objects
         for i in range(7):  # Max 7 nearby objects
-            obj_start = nearby_start + i * 6
-            if obj_start + 6 > len(state):
+            obj_start = nearby_start + i * 8
+            if obj_start + 8 > len(state):
                 break
             
             obj_pos = state[obj_start:obj_start+3]
@@ -183,8 +195,8 @@ class RuleBasedPolicy(BasePolicy):
         threats = []
         
         for i in range(7):
-            obj_start = nearby_start + i * 6
-            if obj_start + 6 > len(state):
+            obj_start = nearby_start + i * 8
+            if obj_start + 8 > len(state):
                 break
             
             obj_pos = state[obj_start:obj_start+3]
@@ -212,6 +224,27 @@ class RuleBasedPolicy(BasePolicy):
                     })
         
         if not threats:
+            # If there are nearby objects (within 30 km) but not qualifying as TCA threat,
+            # use a low-level avoidance action to promote non-zero maneuvering.
+            nearby_close = []
+            nearby_start = 8
+            for i in range(7):
+                obj_start = nearby_start + i * 8
+                if obj_start + 8 > len(state):
+                    break
+
+                obj_pos = state[obj_start:obj_start+3]
+                obj_vel = state[obj_start+3:obj_start+6]
+                if np.allclose(obj_pos, 0) and np.allclose(obj_vel, 0):
+                    continue
+
+                distance = np.linalg.norm(obj_pos - own_pos)
+                if distance < 30.0:
+                    nearby_close.append(distance)
+
+            if nearby_close and fuel_ratio > 0.1:
+                return 1  # prograde small correction
+
             return 0
         
         # Sort by urgency (TCA / distance)
@@ -224,7 +257,7 @@ class RuleBasedPolicy(BasePolicy):
         rel_pos = primary_threat['rel_pos']
         
         # More aggressive with lower fuel threshold
-        fuel_limit = 0.2 if self.aggression > 0.7 else 0.05
+        fuel_limit = 0.4 if self.aggression > 0.7 else 0.1
         
         if fuel_ratio < fuel_limit:
             return 0  # Conserve fuel
@@ -277,8 +310,8 @@ class ThresholdRulePolicy(BasePolicy):
         min_distance = float("inf")
 
         for i in range(7):
-            obj_start = nearby_start + i * 6
-            if obj_start + 6 > len(state):
+            obj_start = nearby_start + i * 8
+            if obj_start + 8 > len(state):
                 break
 
             obj_pos = state[obj_start : obj_start + 3]
@@ -330,8 +363,8 @@ class FuelAwareThresholdRulePolicy(BasePolicy):
         min_distance = float("inf")
 
         for i in range(7):
-            obj_start = nearby_start + i * 6
-            if obj_start + 6 > len(state):
+            obj_start = nearby_start + i * 8
+            if obj_start + 8 > len(state):
                 break
 
             obj_pos = state[obj_start : obj_start + 3]
@@ -357,7 +390,7 @@ class MARLPolicy(BasePolicy):
     MARL policy wrapper (uses trained MARL model).
     """
     
-    def __init__(self, marl_trainer):
+    def __init__(self, marl_trainer, deterministic: bool = True):
         """
         Initialize MARL policy.
         
@@ -365,6 +398,7 @@ class MARLPolicy(BasePolicy):
             marl_trainer: Trained MARL trainer instance
         """
         self.marl_trainer = marl_trainer
+        self.deterministic = bool(deterministic)
     
     def select_action(self, state: np.ndarray, agent_id: str) -> int:
         """
@@ -378,8 +412,15 @@ class MARLPolicy(BasePolicy):
             Action index
         """
         observations = {agent_id: state}
-        actions = self.marl_trainer.get_actions(observations)
+        actions = self.select_actions(observations)
         return actions.get(agent_id, 0)
+
+    def select_actions(self, observations: Dict[str, np.ndarray]) -> Dict[str, int]:
+        """Select joint actions using the MARL trainer in one call."""
+        return self.marl_trainer.get_actions(
+            observations,
+            deterministic=self.deterministic,
+        )
     
     def reset(self):
         """Reset policy."""
@@ -424,6 +465,13 @@ class PolicyManager:
             raise ValueError("No active policy selected")
         
         return self.policies[self.active_policy].select_action(state, agent_id)
+
+    def select_actions(self, observations: Dict[str, np.ndarray]) -> Dict[str, int]:
+        """Select actions for all visible agents using the active policy."""
+        if self.active_policy is None:
+            raise ValueError("No active policy selected")
+
+        return self.policies[self.active_policy].select_actions(observations)
     
     def get_available_policies(self) -> list:
         """Get list of registered policies."""

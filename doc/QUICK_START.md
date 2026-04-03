@@ -1,60 +1,82 @@
 # Quick Start - FuelSafe-MARL-LEO
 
-## 1) Setup
+## 1. Install
 
-```bash
+```powershell
 cd "c:\Users\molaw\code\Final Year Project\FuelSafe-MARL-LEO"
-python -m venv venv
-venv\Scripts\activate
-pip install -r requirements.txt
+python -m venv .venv
+.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
-## 2) Run the demo
+## 2. Run a Demo
 
-```bash
-python main.py --demo
+```powershell
+.venv\Scripts\python.exe main.py --demo --include-marl --episodes 1 --steps 50
 ```
 
-This runs a small collision-avoidance comparison and writes logs in `outputs/`.
+This runs baseline, rule-based, and MARL policy comparisons and writes logs under `outputs/`.
 
-## 3) Run the reproducible test-case framework
+## 3. Launch the Local UI
 
-```bash
-python experiments/run_collision_avoidance_tests.py --quick --mc-runs 3 --max-debris 200
+```powershell
+.venv\Scripts\streamlit.exe run ui\streamlit_app.py
 ```
 
-### Useful options
+The UI lets you:
+- run demos and experiments
+- train and validate MARL from local CSVs
+- run any named test case from `TC1` to `TC8`
+- inspect generated CSVs with interactive Plotly charts
 
-```bash
-# single test case
-python experiments/run_collision_avoidance_tests.py --test-cases TC1_no_maneuver --mc-runs 30 --max-debris 200
+## 4. Run the Reproducible Test Framework
 
-# include MARL policy (requires model or --marl-untrained)
-python experiments/run_collision_avoidance_tests.py --include-marl --marl-untrained --quick
+```powershell
+.venv\Scripts\python.exe experiments/run_collision_avoidance_tests.py --quick --mc-runs 3 --max-debris 200
 ```
 
-## 4) Understand outputs
+Useful variants:
 
-Each run folder under `outputs/test_framework*` contains:
-- `test_runs_per_policy.csv`: one row per Monte Carlo run and policy
-- `aggregated_summary.csv`: mean/std summary by test case and policy
+```powershell
+# Single scenario family
+.venv\Scripts\python.exe experiments/run_collision_avoidance_tests.py --test-cases TC1_no_maneuver --mc-runs 10 --max-debris 200
+
+# Include MARL in the dedicated MARL and fuel-constrained cases
+.venv\Scripts\python.exe experiments/run_collision_avoidance_tests.py --test-cases TC4_marl,TC6_fuel_constrained --mc-runs 3 --max-debris 200 --include-marl --marl-untrained
+
+# Synthetic high-collision comparison case
+.venv\Scripts\python.exe experiments/run_collision_avoidance_tests.py --test-cases TC8_hypothetical_collision_cluster --mc-runs 1 --max-debris 200 --include-marl --marl-model-path outputs\marl_train_validation\marl_trained_from_train_dataset.pth
+```
+
+## 5. Train And Validate MARL From ESA CDM Data
+
+```powershell
+.venv\Scripts\python.exe sim/dataset_integration.py --train-csv data\train_data.csv --test-csv data\test_data.csv --output-dir outputs\marl_train_validation --risk-threshold -7.0 --train-scenarios 12 --test-scenarios 8 --episodes-per-scenario 4 --max-steps 120 --num-satellites 3 --num-debris 10
+```
+
+Dataset-derived scenarios now parameterize the actual first satellite-debris encounter used during training and validation.
+
+Key outputs:
+- `outputs/marl_train_validation/marl_trained_from_train_dataset.pth`
+- `outputs/marl_train_validation/train_metrics.csv`
+- `outputs/marl_train_validation/validation_policy_summary.csv`
+- `outputs/marl_train_validation/train_validation_report.json`
+- `outputs/marl_train_validation/interactive_validation_summary_mean_fuel.html`
+
+## 6. Outputs
+
+Common files written by experiments:
+- `test_runs_per_policy.csv`
+- `aggregated_summary.csv`
 - `plot_mean_collisions.png`
 - `plot_mean_fuel.png`
 - `plot_mean_maneuvers.png`
 - `plot_mean_secondary_conjunctions.png`
-- optional: `ttest_collisions.csv` and `pareto_frontier_fuel_vs_collisions.csv`
+- `interactive_summary_mean_collisions.html`
+- `interactive_runs_total_fuel_used.html`
 
-## 5) Core policies currently available
-
-- `no_op` (worst-case, no maneuver)
-- `baseline` (heuristic)
-- `rule_based` (existing TCA-based logic)
-- `threshold_rule` (if distance < threshold => burn)
-- `fuel_aware_threshold_rule`
-- `marl` (optional, when trainer/model is provided)
-
-## 6) Important metric notes
+## 7. Notes
 
 - Distances are in `km`.
-- Collision events are counted when `distance < collision_threshold_km`.
-- For fair comparison, use same seed/scenario settings across policies.
+- Velocities are in `km/s`.
+- Fuel use is penalized using actual fuel burned per step, not just a flat action penalty.
+- Maneuver effects persist across steps through state offsets relative to the SGP4 reference orbit.

@@ -16,6 +16,7 @@ stable-baselines3>=2.0.0
 # Visualization
 matplotlib>=3.7.0
 plotly>=5.14.0
+streamlit>=1.41.0
 
 # Utilities
 tqdm>=4.65.0

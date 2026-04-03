@@ -7,7 +7,7 @@ import hashlib
 import numpy as np
 from dataclasses import dataclass
 from typing import Tuple, Dict, List, Optional
-from datetime import datetime, timedelta
+from datetime import datetime, timezone
 from sgp4.api import Satrec
 
 
@@ -113,19 +113,23 @@ class OrbitPropagator:
     @staticmethod
     def _datetime_to_jd(dt: datetime) -> Tuple[float, float]:
         """Convert datetime to JD and fraction."""
-        # Reference epoch
-        ref_dt = datetime(1858, 11, 17, 0, 0, 0)  # JD 2400000.5
+        # Normalize to UTC naive datetime for JD calculation
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+
+        # Reference epoch (naive UTC)
+        ref_dt = datetime(1858, 11, 17, 0, 0, 0)
         delta = dt - ref_dt
         jd_start = 2400000.5
-        
-        # Compute JD
-        total_days = delta.days + delta.seconds / 86400.0
+
+        # Compute JD (including fractional day)
+        total_days = delta.days + delta.seconds / 86400.0 + delta.microseconds / 86400.0 / 1e6
         jd = jd_start + total_days
-        
+
         # Separate integer and fractional parts
         jd_int = int(jd)
         jd_frac = jd - jd_int
-        
+
         return float(jd_int), float(jd_frac)
     
     def relative_state(self, obj1_state: OrbitalState, 
@@ -148,7 +152,9 @@ class OrbitPropagator:
                            semi_major_axis_km: float = 6800,
                            inclination_deg: float = 51.6,
                            eccentricity: float = 0.0001,
-                           epoch_datetime: Optional[datetime] = None) -> None:
+                           epoch_datetime: Optional[datetime] = None,
+                           mean_anomaly_deg: float = 0.0,
+                           raan_deg: float = 0.0) -> None:
         """
         Generate a sample TLE for testing (circular orbit).
         
@@ -158,6 +164,8 @@ class OrbitPropagator:
             inclination_deg: Inclination in degrees
             eccentricity: Eccentricity
             epoch_datetime: Fixed epoch to keep scenarios reproducible
+            mean_anomaly_deg: Initial mean anomaly in degrees
+            raan_deg: Initial RAAN in degrees
         """
         # Create a simplified TLE (note: proper TLE generation is complex)
         # This creates a basic LEO TLE
@@ -167,7 +175,9 @@ class OrbitPropagator:
         satnum = self._stable_satnum(object_id)
 
         # Current epoch (year and day of year) - overridden for reproducibility.
-        now = epoch_datetime or datetime.utcnow()
+        now = epoch_datetime or datetime.now(timezone.utc)
+        if now.tzinfo is not None:
+            now = now.astimezone(timezone.utc)
         year = now.year % 100  # Last two digits
         day_of_year = now.timetuple().tm_yday
         epoch = f"{year:02d}{day_of_year:03d}.00000000"
@@ -177,7 +187,7 @@ class OrbitPropagator:
         
         # Simplified TLE lines (following standard format)
         line1 = f"1 {satnum:05d}U 00000    {epoch}  .00000000  00000-0  00000-0 0     9"
-        line2 = f"2 {satnum:05d} {inclination_deg:8.4f} {0.0:8.4f} {ecc_field} {0.0:8.4f} {0.0:8.4f} {anomaly_motion:11.8f} {0:5d}"
+        line2 = f"2 {satnum:05d} {inclination_deg:8.4f} {raan_deg:8.4f} {ecc_field} {0.0:8.4f} {mean_anomaly_deg:8.4f} {anomaly_motion:11.8f} {0:5d}"
         
         self.load_tle(object_id, line1, line2)
 

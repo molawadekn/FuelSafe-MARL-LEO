@@ -1,304 +1,444 @@
 """
-Dataset Integration Module - Connect ESA CDM CSV data with FuelSafe simulator
-
-This module demonstrates how to:
-1. Load real conjunction data from CSV
-2. Configure simulation scenarios from actual events
-3. Run simulations with real-world conjunction data
-4. Compare policy performance on real events
+Dataset integration utilities for ESA CDM-driven MARL training and validation.
 """
 
+from __future__ import annotations
+
+import json
 import sys
 from pathlib import Path
-from typing import List, Dict, Optional
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
 
 # Add project modules
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from marl.marl_trainer import MARLTrainer
 from sim.csv_data_loader import CSVDataLoader
+from sim.reporting import save_summary_charts, save_run_distribution_charts, save_training_progress_charts
 from sim.simulator import SimulationRunner
-from sim.orbit_propagator import OrbitPropagator
-from sim.conjunction_detector import ConjunctionDetector
 
 
 class DatasetIntegration:
-    """Interface for integrating ESA CDM CSV data with FuelSafe simulator."""
-    
+    """Interface for integrating ESA CDM CSV data with the FuelSafe simulator."""
+
     def __init__(self, csv_path: str, verbose: bool = True):
-        """
-        Initialize dataset integration.
-        
-        Args:
-            csv_path: Path to ESA CDM CSV file
-            verbose: Print progress information
-        """
-        self.csv_path = csv_path
+        self.csv_path = str(csv_path)
         self.verbose = verbose
         self.loader = CSVDataLoader(csv_path, verbose=verbose)
-        self.data = None
-        self.scenarios = []
-    
-    def load_dataset(self, max_rows: Optional[int] = None):
-        """Load CSV dataset."""
+        self.data: Optional[pd.DataFrame] = None
+        self.scenarios: List[Dict] = []
+
+    def load_dataset(self, max_rows: Optional[int] = None) -> pd.DataFrame:
         self.data = self.loader.load(max_rows=max_rows)
         if self.verbose:
             print(f"[OK] Loaded {len(self.data)} events from CSV")
-    
-    def get_risk_distribution(self) -> Dict:
-        """Get risk score distribution for scenario selection."""
+        return self.data
+
+    def get_risk_distribution(self) -> Dict[str, int]:
         if self.data is None:
             raise RuntimeError("Dataset not loaded. Call load_dataset() first.")
-        
-        risk_bins = {
-            'critical': len(self.data[self.data['risk'] > -5.0]),
-            'high': len(self.data[(self.data['risk'] > -7.0) & (self.data['risk'] <= -5.0)]),
-            'medium': len(self.data[(self.data['risk'] > -9.0) & (self.data['risk'] <= -7.0)]),
-            'low': len(self.data[self.data['risk'] <= -9.0]),
+
+        return {
+            "critical": int((self.data["risk"] > -5.0).sum()),
+            "high": int(((self.data["risk"] > -7.0) & (self.data["risk"] <= -5.0)).sum()),
+            "medium": int(((self.data["risk"] > -9.0) & (self.data["risk"] <= -7.0)).sum()),
+            "low": int((self.data["risk"] <= -9.0).sum()),
         }
-        return risk_bins
-    
-    def create_scenarios_from_dataset(self, 
-                                     risk_threshold: float = -7.0,
-                                     max_scenarios: int = 10) -> List[Dict]:
-        """
-        Create simulation scenarios from high-risk events in dataset.
-        
-        Args:
-            risk_threshold: Only include events above this risk threshold
-            max_scenarios: Maximum number of scenarios to create
-        
-        Returns:
-            List of scenario dictionaries
-        """
+
+    def create_scenarios_from_dataset(
+        self, risk_threshold: float = -7.0, max_scenarios: int = 10
+    ) -> List[Dict]:
         if self.data is None:
             raise RuntimeError("Dataset not loaded. Call load_dataset() first.")
-        
-        # Extract high-risk events
-        high_risk = self.loader.extract_high_risk_events(
-            risk_threshold=risk_threshold,
-            count=max_scenarios
-        )
-        
-        # Create scenarios
-        scenarios = self.loader.get_batch_scenarios(high_risk, max_scenarios=max_scenarios)
-        
+
+        high_risk = self.data[self.data["risk"] >= risk_threshold].sort_values("risk", ascending=False)
+        if "event_id" in high_risk.columns:
+            high_risk = high_risk.drop_duplicates(subset=["event_id"], keep="first")
+
+        if high_risk.empty:
+            scenarios = []
+        else:
+            selection_count = min(max_scenarios, len(high_risk))
+            selection_indices = np.linspace(0, len(high_risk) - 1, num=selection_count, dtype=int)
+            selected_events = high_risk.iloc[np.unique(selection_indices)]
+            scenarios = self.loader.get_batch_scenarios(selected_events, max_scenarios=max_scenarios)
+
         self.scenarios = scenarios
-        
+
         if self.verbose:
-            print(f"[OK] Created {len(scenarios)} scenarios from dataset")
-        
+            print(
+                f"[OK] Created {len(scenarios)} scenarios from dataset "
+                f"(risk-stratified unique-event selection from {len(high_risk)} candidates)"
+            )
+
         return scenarios
-    
-    def run_scenario_batch(self, 
-                          scenarios: List[Dict],
-                          policy_types: List[str] = ['baseline', 'rule_based'],
-                          num_episodes: int = 3,
-                          verbose: bool = True) -> Dict:
-        """
-        Run batch of scenarios with different policies.
-        
-        Args:
-            scenarios: List of scenario dicts
-            policy_types: Policy types to compare
-            num_episodes: Episodes per scenario
-            verbose: Print progress
-        
-        Returns:
-            Results summary
-        """
-        results = {
-            'scenario_count': len(scenarios),
-            'policies': policy_types,
-            'policy_results': {policy: [] for policy in policy_types},
-            'aggregate_metrics': {}
-        }
-        
-        for scenario_idx, scenario in enumerate(scenarios):
-            if verbose:
-                print(f"\n{'='*70}")
-                print(f"Scenario {scenario_idx + 1}/{len(scenarios)}: {scenario['name']}")
-                print(f"Risk Level: {scenario['risk_level']}")
-                print(f"Miss Distance: {scenario['conjunction_info']['miss_distance']:.0f} m")
-                print(f"Relative Speed: {scenario['conjunction_info']['relative_speed']:.0f} m/s")
-                print(f"{'='*70}")
-            
-            for policy in policy_types:
-                if verbose:
-                    print(f"\n  Testing policy: {policy}")
-                
-                # Run simulation (placeholder - would integrate with actual SimulationRunner)
-                scenario_result = {
-                    'scenario': scenario['name'],
-                    'policy': policy,
-                    'risk_level': scenario['risk_level'],
-                    'miss_distance': scenario['conjunction_info']['miss_distance'],
-                    'episodes': num_episodes,
-                    # Results would be populated by actual simulation
-                    'avg_collisions': 0,
-                    'avg_fuel_used': 0,
-                    'avg_reward': 0,
-                }
-                
-                results['policy_results'][policy].append(scenario_result)
-        
-        return results
-    
+
     def generate_integration_report(self) -> str:
-        """Generate comprehensive integration report."""
         if self.data is None:
             return "No data loaded"
-        
+
         risk_dist = self.get_risk_distribution()
-        
-        report = f"""
-╔══════════════════════════════════════════════════════════════════════╗
-║     FuelSafe-MARL-LEO Dataset Integration Report                     ║
-╚══════════════════════════════════════════════════════════════════════╝
+        total = max(len(self.data), 1)
 
-DATASET SUMMARY
-───────────────────────────────────────────────────────────────────────
-  File: {self.csv_path}
-  Total Events: {len(self.data):,}
-  Format: ESA CDM (Conjunction Data Message)
-  
-  Risk Score Distribution:
-    • Critical (risk > -5.0):       {risk_dist['critical']:5d} events ({100*risk_dist['critical']/len(self.data):5.1f}%)
-    • High (-7.0 < risk < -5.0):   {risk_dist['high']:5d} events ({100*risk_dist['high']/len(self.data):5.1f}%)
-    • Medium (-9.0 < risk < -7.0): {risk_dist['medium']:5d} events ({100*risk_dist['medium']/len(self.data):5.1f}%)
-    • Low (risk < -9.0):            {risk_dist['low']:5d} events ({100*risk_dist['low']/len(self.data):5.1f}%)
+        return (
+            "FuelSafe Dataset Integration Report\n"
+            f"CSV: {self.csv_path}\n"
+            f"Rows loaded: {len(self.data)}\n"
+            f"Scenarios prepared: {len(self.scenarios)}\n"
+            f"Risk distribution: critical={risk_dist['critical']} "
+            f"high={risk_dist['high']} medium={risk_dist['medium']} low={risk_dist['low']}\n"
+            f"Miss distance range (m): {self.data['miss_distance'].min():.0f} .. "
+            f"{self.data['miss_distance'].max():.0f}\n"
+            f"Relative speed range (m/s): {self.data['relative_speed'].min():.0f} .. "
+            f"{self.data['relative_speed'].max():.0f}\n"
+            f"Time to TCA range (hours): {self.data['time_to_tca'].min():.2f} .. "
+            f"{self.data['time_to_tca'].max():.2f}\n"
+            f"Data completeness: {100 * (1 - self.data.isnull().sum().sum() / (total * len(self.data.columns))):.2f}%"
+        )
 
-CONJUNCTION CHARACTERISTICS
-───────────────────────────────────────────────────────────────────────
-  Time to TCA (hours):      {self.data['time_to_tca'].min():.1f} - {self.data['time_to_tca'].max():.1f}
-  Miss Distance (m):        {self.data['miss_distance'].min():.0f} - {self.data['miss_distance'].max():.0f}
-  Relative Speed (m/s):     {self.data['relative_speed'].min():.0f} - {self.data['relative_speed'].max():.0f}
-
-  Orbital Elements (Target):
-    • Semi-major axis (km): {self.data['t_j2k_sma'].mean():.1f} ± {self.data['t_j2k_sma'].std():.1f}
-    • Inclination (deg):    {self.data['t_j2k_inc'].mean():.1f} ± {self.data['t_j2k_inc'].std():.1f}
-    • Eccentricity:         {self.data['t_j2k_ecc'].mean():.6f} ± {self.data['t_j2k_ecc'].std():.6f}
-
-SCENARIOS CREATED
-───────────────────────────────────────────────────────────────────────
-  Count: {len(self.scenarios)}
-  
-  {"Scenario Name" if self.scenarios else "No scenarios created yet":40s} {"Risk Level":12s} {"Miss Dist":10s}
-  {"-"*70}
-"""
-        for scenario in self.scenarios[:10]:
-            report += f"  {scenario['name']:40s} {scenario['risk_level']:12s} {scenario['conjunction_info']['miss_distance']:>9.0f}m\n"
-        
-        if len(self.scenarios) > 10:
-            report += f"  ... and {len(self.scenarios) - 10} more scenarios\n"
-        
-        report += f"""
-INTEGRATION STATUS
-───────────────────────────────────────────────────────────────────────
-  [OK] CSV Data Loader: WORKING (sim/csv_data_loader.py)
-  [OK] Dataset Access:  WORKING (test_data.csv accessible)
-  [OK] Scenario Generation: WORKING
-  [OK] Orbit Parameters: EXTRACTED
-  [READY] Simulator Integration: READY (connect with SimulationRunner)
-  [READY] Policy Comparison: READY (multiple policies available)
-  [READY] Metrics Collection: READY
-
-NEXT STEPS
-───────────────────────────────────────────────────────────────────────
-  1. Select high-risk scenarios from dataset
-  2. Configure satellite orbits from orbital elements
-  3. Run simulations with different policies
-  4. Compare collision avoidance performance
-  5. Analyze fuel consumption across policies
-  6. Generate publication-ready comparison plots
-
-KEY COLUMNS AVAILABLE
-───────────────────────────────────────────────────────────────────────
-  Conjunction Data:
-    • event_id, time_to_tca, mission_id, risk
-    • miss_distance, relative_speed
-    • relative_position_r/t/n, relative_velocity_r/t/n
-
-  Orbital Elements (Target & Chaser):
-    • SMA, eccentricity, inclination
-    • Position/velocity components (RTN frame)
-    • Covariance matrices (sigma_r, sigma_t, sigma_n, etc.)
-
-  Environmental Data:
-    • Solar activity indices (F10, F3M, SSN, AP)
-    • Atmospheric density indicators
-
-STATISTICS
-───────────────────────────────────────────────────────────────────────
-  Total columns: {len(self.data.columns)}
-  Memory usage: {self.data.memory_usage(deep=True).sum() / 1024**2:.2f} MB
-  Data completeness: {100 * (1 - self.data.isnull().sum() / len(self.data)).mean():.1f}%
-
-USAGE EXAMPLE
-───────────────────────────────────────────────────────────────────────
-  from sim.dataset_integration import DatasetIntegration
-  
-  # Initialize
-  integration = DatasetIntegration(csv_path, verbose=True)
-  
-  # Load data
-  integration.load_dataset(max_rows=10000)
-  
-  # Create scenarios
-  scenarios = integration.create_scenarios_from_dataset(
-      risk_threshold=-7.0,
-      max_scenarios=20
-  )
-  
-  # Run simulations (pseudo-code)
-  for scenario in scenarios:
-      runner = SimulationRunner(
-          num_satellites=3,
-          num_debris=5,
-          policy_type='baseline'
-      )
-      results = runner.run_scenario(scenario)
-        """
-        
-        return report
-    
-    def print_report(self):
-        """Print integration report to console."""
+    def print_report(self) -> None:
         print(self.generate_integration_report())
 
+    @staticmethod
+    def _scenario_max_steps(scenario: Dict, fallback_max_steps: int) -> int:
+        duration_hours = float(scenario.get("duration_hours", 0.0) or 0.0)
+        if duration_hours <= 0:
+            return int(fallback_max_steps)
+        steps_from_duration = int((duration_hours * 3600.0) // 60.0)
+        return max(1, min(int(fallback_max_steps), steps_from_duration if steps_from_duration > 0 else fallback_max_steps))
 
-# ============================================================================
-# QUICK START EXAMPLE
-# ============================================================================
+    @staticmethod
+    def _build_runner(
+        *,
+        scenario: Dict,
+        policy_type: str,
+        max_steps: int,
+        num_satellites: int,
+        num_debris: int,
+        initial_fuel_kg: float,
+        marl_trainer: Optional[MARLTrainer] = None,
+    ) -> Tuple[SimulationRunner, int]:
+        runner = SimulationRunner(
+            num_satellites=num_satellites,
+            num_debris=num_debris,
+            use_safety_filter=True,
+            safety_threshold_km=0.5,
+            distance_threshold_km=50.0,
+            # Use a tighter collision threshold for CDM-driven validation than the
+            # coarse Monte Carlo stress tests, otherwise sub-km miss distances are
+            # all labeled as immediate collisions.
+            collision_threshold_km=0.5,
+            high_risk_mode=True,
+            policy_type=policy_type,
+            enable_logging=False,
+            initial_fuel_kg=initial_fuel_kg,
+            max_fuel_kg=initial_fuel_kg,
+            scenario_config=scenario,
+            marl_trainer=marl_trainer,
+            policy_kwargs={
+                "threshold_km": 5.0,
+                "dv_action": 1,
+                "min_fuel_ratio": 0.2,
+                "baseline_risk_threshold": 0.5,
+                "rule_based_aggression": 0.5,
+            },
+        )
+        return runner, DatasetIntegration._scenario_max_steps(scenario, max_steps)
+
+    def train_marl_from_dataset(
+        self,
+        *,
+        max_rows: Optional[int] = 1000,
+        risk_threshold: float = -7.0,
+        max_scenarios: int = 10,
+        episodes_per_scenario: int = 5,
+        max_steps: int = 200,
+        num_satellites: int = 3,
+        num_debris: int = 5,
+        initial_fuel_kg: float = 1000.0,
+        marl_epochs_per_batch: int = 3,
+        save_model_path: Optional[str] = None,
+    ) -> Dict:
+        self.load_dataset(max_rows=max_rows)
+        scenarios = self.create_scenarios_from_dataset(
+            risk_threshold=risk_threshold,
+            max_scenarios=max_scenarios,
+        )
+
+        trainer = MARLTrainer(num_agents=num_satellites)
+        metrics: List[Dict] = []
+
+        for scenario in scenarios:
+            if self.verbose:
+                print(f"\n[TRAIN] Scenario: {scenario['name']} ({scenario['risk_level']})")
+
+            runner, scenario_steps = self._build_runner(
+                scenario=scenario,
+                policy_type="marl",
+                max_steps=max_steps,
+                num_satellites=num_satellites,
+                num_debris=num_debris,
+                initial_fuel_kg=initial_fuel_kg,
+                marl_trainer=trainer,
+            )
+
+            env = runner.env
+
+            for episode_idx in range(episodes_per_scenario):
+                observations = env.reset()
+                done = False
+                step = 0
+
+                while not done and step < scenario_steps:
+                    actions, log_probs, central_value = trainer.get_action_details(observations)
+                    next_obs, rewards, dones, _info = env.step(actions)
+                    trainer.collect_experience(
+                        observations,
+                        rewards,
+                        next_obs,
+                        dones,
+                        actions,
+                        log_probs=log_probs,
+                        central_value=central_value,
+                    )
+                    observations = next_obs
+                    done = bool(dones.get("__all__", False))
+                    step += 1
+
+                train_stats = trainer.train(num_epochs=marl_epochs_per_batch)
+                row = {
+                    "scenario": scenario["name"],
+                    "risk_level": scenario["risk_level"],
+                    "episode": episode_idx + 1,
+                    "final_collisions": env.episode_collisions,
+                    "final_fuel_used": env.episode_fuel_used,
+                    "final_steps": env.step_count,
+                    **train_stats,
+                }
+                metrics.append(row)
+
+                if self.verbose:
+                    print(
+                        f"  ep{episode_idx + 1}/{episodes_per_scenario} "
+                        f"collisions={env.episode_collisions} "
+                        f"fuel={env.episode_fuel_used:.3f} "
+                        f"steps={env.step_count} "
+                        f"actor_loss={train_stats.get('actor_loss', 0.0):.4f}"
+                    )
+
+        if save_model_path:
+            save_path = Path(save_model_path)
+            save_path.parent.mkdir(parents=True, exist_ok=True)
+            trainer.save(str(save_path))
+            if self.verbose:
+                print(f"[TRAIN] Saved MARL model to {save_path}")
+
+        metrics_df = pd.DataFrame(metrics)
+        summary = {
+            "trained_model_path": save_model_path,
+            "num_scenarios": len(scenarios),
+            "episodes_per_scenario": episodes_per_scenario,
+            "mean_collisions": float(metrics_df["final_collisions"].mean()) if not metrics_df.empty else 0.0,
+            "mean_fuel_used": float(metrics_df["final_fuel_used"].mean()) if not metrics_df.empty else 0.0,
+            "mean_steps": float(metrics_df["final_steps"].mean()) if not metrics_df.empty else 0.0,
+            "metrics": metrics,
+        }
+        return summary
+
+    def evaluate_policies_on_dataset(
+        self,
+        *,
+        policy_types: List[str],
+        max_rows: Optional[int] = 1000,
+        risk_threshold: float = -7.0,
+        max_scenarios: int = 10,
+        max_steps: int = 200,
+        num_satellites: int = 3,
+        num_debris: int = 5,
+        initial_fuel_kg: float = 1000.0,
+        marl_model_path: Optional[str] = None,
+    ) -> Dict:
+        self.load_dataset(max_rows=max_rows)
+        scenarios = self.create_scenarios_from_dataset(
+            risk_threshold=risk_threshold,
+            max_scenarios=max_scenarios,
+        )
+
+        marl_trainer: Optional[MARLTrainer] = None
+        if "marl" in policy_types:
+            marl_trainer = MARLTrainer(num_agents=num_satellites)
+            if marl_model_path is None:
+                raise ValueError("marl_model_path must be provided when evaluating the MARL policy.")
+            marl_trainer.load(marl_model_path)
+
+        rows: List[Dict] = []
+        for scenario in scenarios:
+            for policy_type in policy_types:
+                runner, scenario_steps = self._build_runner(
+                    scenario=scenario,
+                    policy_type=policy_type,
+                    max_steps=max_steps,
+                    num_satellites=num_satellites,
+                    num_debris=num_debris,
+                    initial_fuel_kg=initial_fuel_kg,
+                    marl_trainer=marl_trainer if policy_type == "marl" else None,
+                )
+                stats = runner.run_episode(max_steps=scenario_steps, verbose=False)
+                rows.append(
+                    {
+                        "scenario": scenario["name"],
+                        "risk_level": scenario["risk_level"],
+                        "policy": policy_type,
+                        **stats,
+                    }
+                )
+
+        episodes_df = pd.DataFrame(rows)
+        summary_df = (
+            episodes_df.groupby("policy", dropna=False)
+            .agg(
+                mean_collisions=("total_collisions", "mean"),
+                mean_fuel=("total_fuel_used", "mean"),
+                mean_maneuvers=("total_maneuvers_executed", "mean"),
+                mean_secondary_conjunctions=("total_secondary_conjunctions", "mean"),
+                mean_near_misses=("total_near_misses", "mean"),
+                mean_min_separation_km=("min_separation_distance_km", "mean"),
+            )
+            .reset_index()
+            .sort_values("policy")
+        )
+
+        return {
+            "num_scenarios": len(scenarios),
+            "episode_metrics": episodes_df.to_dict(orient="records"),
+            "policy_summary": summary_df.to_dict(orient="records"),
+        }
+
+
+def train_and_validate_marl(
+    *,
+    train_csv: str,
+    test_csv: str,
+    output_dir: str,
+    train_max_rows: int,
+    test_max_rows: int,
+    risk_threshold: float,
+    train_scenarios: int,
+    test_scenarios: int,
+    episodes_per_scenario: int,
+    max_steps: int,
+    num_satellites: int,
+    num_debris: int,
+    initial_fuel_kg: float,
+    marl_epochs_per_batch: int,
+    verbose: bool = True,
+) -> Dict:
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    model_path = output_path / "marl_trained_from_train_dataset.pth"
+    train_metrics_path = output_path / "train_metrics.csv"
+    validation_metrics_path = output_path / "validation_episode_metrics.csv"
+    validation_summary_path = output_path / "validation_policy_summary.csv"
+    report_path = output_path / "train_validation_report.json"
+
+    train_integration = DatasetIntegration(train_csv, verbose=verbose)
+    train_result = train_integration.train_marl_from_dataset(
+        max_rows=train_max_rows,
+        risk_threshold=risk_threshold,
+        max_scenarios=train_scenarios,
+        episodes_per_scenario=episodes_per_scenario,
+        max_steps=max_steps,
+        num_satellites=num_satellites,
+        num_debris=num_debris,
+        initial_fuel_kg=initial_fuel_kg,
+        marl_epochs_per_batch=marl_epochs_per_batch,
+        save_model_path=str(model_path),
+    )
+    train_metrics_df = pd.DataFrame(train_result["metrics"])
+    train_metrics_df.to_csv(train_metrics_path, index=False)
+
+    test_integration = DatasetIntegration(test_csv, verbose=verbose)
+    validation_result = test_integration.evaluate_policies_on_dataset(
+        policy_types=["no_op", "fuel_aware_threshold_rule", "rule_based", "marl"],
+        max_rows=test_max_rows,
+        risk_threshold=risk_threshold,
+        max_scenarios=test_scenarios,
+        max_steps=max_steps,
+        num_satellites=num_satellites,
+        num_debris=num_debris,
+        initial_fuel_kg=initial_fuel_kg,
+        marl_model_path=str(model_path),
+    )
+    validation_metrics_df = pd.DataFrame(validation_result["episode_metrics"])
+    validation_summary_df = pd.DataFrame(validation_result["policy_summary"])
+    validation_metrics_df.to_csv(validation_metrics_path, index=False)
+    validation_summary_df.to_csv(validation_summary_path, index=False)
+
+    save_training_progress_charts(train_metrics_df, output_path, prefix="interactive_train_progress")
+    save_summary_charts(validation_summary_df, output_path, prefix="interactive_validation_summary")
+    save_run_distribution_charts(validation_metrics_df, output_path, prefix="interactive_validation_runs")
+
+    report = {
+        "train_csv": str(train_csv),
+        "test_csv": str(test_csv),
+        "model_path": str(model_path),
+        "train_summary": {
+            k: v for k, v in train_result.items() if k != "metrics"
+        },
+        "validation_summary": validation_result["policy_summary"],
+    }
+    report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    return report
+
 
 if __name__ == "__main__":
-    # Dataset path
-    csv_path = r"C:\Users\molaw\OneDrive\Documents\Study\Mtech-SY\Tech Seminar\dataset\test_data.csv"
-    
-    print("\n" + "="*70)
-    print("FuelSafe Dataset Integration Example")
-    print("="*70 + "\n")
-    
-    # Initialize integration
-    integration = DatasetIntegration(csv_path, verbose=True)
-    
-    # Load dataset
-    print("Step 1: Loading dataset...")
-    integration.load_dataset(max_rows=1000)
-    
-    # Create scenarios
-    print("\nStep 2: Creating scenarios from high-risk events...")
-    scenarios = integration.create_scenarios_from_dataset(
-        risk_threshold=-6.0,
-        max_scenarios=5
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Train MARL on an ESA CDM training set and validate on a test set."
     )
-    
-    # Print report
-    print("\nStep 3: Generated Integration Report")
-    print("="*70)
-    integration.print_report()
-    
-    print("\n" + "="*70)
-    print("Integration Complete!")
-    print("="*70)
-    print("\nNext: Run scenarios with different policies:")
-    print("  python main.py --experiment --dataset test_data.csv")
+    parser.add_argument("--train-csv", type=str, required=True, help="Path to training CSV")
+    parser.add_argument("--test-csv", type=str, required=True, help="Path to test CSV")
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default="outputs/marl_train_validation",
+        help="Directory for model and validation artifacts",
+    )
+    parser.add_argument("--train-max-rows", type=int, default=5000)
+    parser.add_argument("--test-max-rows", type=int, default=2000)
+    parser.add_argument("--risk-threshold", type=float, default=-7.0)
+    parser.add_argument("--train-scenarios", type=int, default=12)
+    parser.add_argument("--test-scenarios", type=int, default=8)
+    parser.add_argument("--episodes-per-scenario", type=int, default=4)
+    parser.add_argument("--max-steps", type=int, default=120)
+    parser.add_argument("--num-satellites", type=int, default=3)
+    parser.add_argument("--num-debris", type=int, default=10)
+    parser.add_argument("--initial-fuel-kg", type=float, default=1000.0)
+    parser.add_argument("--marl-epochs-per-batch", type=int, default=3)
+    args = parser.parse_args()
+
+    result = train_and_validate_marl(
+        train_csv=args.train_csv,
+        test_csv=args.test_csv,
+        output_dir=args.output_dir,
+        train_max_rows=args.train_max_rows,
+        test_max_rows=args.test_max_rows,
+        risk_threshold=args.risk_threshold,
+        train_scenarios=args.train_scenarios,
+        test_scenarios=args.test_scenarios,
+        episodes_per_scenario=args.episodes_per_scenario,
+        max_steps=args.max_steps,
+        num_satellites=args.num_satellites,
+        num_debris=args.num_debris,
+        initial_fuel_kg=args.initial_fuel_kg,
+        marl_epochs_per_batch=args.marl_epochs_per_batch,
+        verbose=True,
+    )
+
+    print("\nTrain/validation report:")
+    print(json.dumps(result, indent=2))

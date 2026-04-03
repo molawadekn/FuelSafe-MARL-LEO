@@ -1,5 +1,0 @@
-test_case,policy,mean_collisions,std_collisions,mean_fuel,std_fuel,mean_maneuvers,mean_secondary_conjunctions,mean_near_misses
-TC7_secondary_conjunctions,fuel_aware_threshold_rule,356.0,,0.14999999999800076,,3.0,307.0,307.0
-TC7_secondary_conjunctions,no_op,356.0,,0.0,,0.0,0.0,309.0
-TC7_secondary_conjunctions,rule_based,356.0,,0.0,,0.0,0.0,309.0
-TC7_secondary_conjunctions,threshold_rule,356.0,,0.14999999999800076,,3.0,307.0,307.0
