@@ -1,81 +1,43 @@
-# Byte-compiled / optimized / DLL files
+# Python
 __pycache__/
 *.py[cod]
-*$py.class
+*.pyo
+*.pyd
+*.pyc
 
-# C extensions
-*.so
+# Jupyter Notebooks
+.ipynb_checkpoints/
 
-# Distribution / packaging
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-pip-wheel-metadata/
-share/python-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-MANIFEST
-
-# PyInstaller
-*.manifest
-*.spec
-
-# Unit test / coverage reports
-htmlcov/
-.tox/
-.nox/
-.coverage
-.coverage.*
-.cache
-nosetests.xml
-coverage.xml
-*.cover
-*.py,cover
-.hypothesis/
-.pytest_cache/
-
-# Virtual environments
+# Environments
+.env/
+.venv/
 venv/
-ENV/
 env/
-.venv
+ENV/
 
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
-.DS_Store
-
-# Environment variables
-.env
-.env.local
-.env.*.local
-
-# Logs
-*.log
-logs/
-
-# Temporary files
-*.tmp
-*.temp
-
-# Local datasets
+# Data and outputs
 data/*.csv
-!data/README.md
+data/*.jsonl
+outputs/
 
-# Generated outputs
-outputs/*
-!outputs/README.md
+# IDE and OS files
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Model checkpoints and saved models
+policies/saved_models/
+policies/debug_run/
+policies/__pycache__/
+
+# Test outputs
+test_output.txt
+
+# Streamlit and UI cache
+.ui/
+
+# Misc
+*.log
+*.tmp
+
+*.jsonl

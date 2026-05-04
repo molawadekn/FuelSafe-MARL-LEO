@@ -4,13 +4,16 @@ Orchestrates the full simulation with orbit propagation, collision detection,
 maneuvers, reward computation, and logging.
 """
 
+import logging
 import numpy as np
 import pandas as pd
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 from datetime import datetime
 from pathlib import Path
 
 from env.ma_env import MultiAgentOrbitalEnv
+from sim.evaluation import compute_efficiency_score
+from sim.realism import RealismConfig
 from safety.cbf_filter import CBFSafetyFilter
 from policies.policy_interface import (
     PolicyManager,
@@ -21,6 +24,9 @@ from policies.policy_interface import (
     FuelAwareThresholdRulePolicy,
     MARLPolicy,
 )
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 class SimulationLogger:
@@ -41,6 +47,7 @@ class SimulationLogger:
         self.fuel_used = []
         self.alerts = []
         self.maneuvers = []
+        self.step_records: List[Dict[str, Any]] = []  # Raw per-step records for realism debugging
 
     def reset(self) -> None:
         """Clear in-memory log buffers before a fresh run."""
@@ -49,14 +56,28 @@ class SimulationLogger:
         self.fuel_used = []
         self.alerts = []
         self.maneuvers = []
+        self.step_records = []
     
     def log_timestep(self, timestep: int, collisions: int, 
-                    fuel_used: float, num_alerts: int) -> None:
-        """Log one timestep."""
+                    fuel_used: float, num_alerts: int,
+                    min_distance_m: float = float("inf"),
+                    max_risk: float = 0.0,
+                    maneuver_count: int = 0,
+                    fuel_remaining: Optional[Dict[str, float]] = None) -> None:
+        """Log one timestep with optional realism-aware fields."""
         self.timesteps.append(timestep)
         self.collisions.append(collisions)
         self.fuel_used.append(fuel_used)
         self.alerts.append(num_alerts)
+        self.step_records.append({
+            "timestep": timestep,
+            "collisions": collisions,
+            "fuel_used": fuel_used,
+            "num_alerts": num_alerts,
+            "min_distance_m": min_distance_m,
+            "max_risk": max_risk,
+            "maneuver_count": maneuver_count,
+        })
     
     def log_maneuver(self, agent_id: str, action: int, delta_v: float,
                     fuel_consumed: float) -> None:
@@ -82,6 +103,7 @@ class SimulationLogger:
         
         df.to_csv(filepath, index=False)
         print(f"Saved simulation log to {filepath}")
+        LOGGER.info("Saved simulation log to %s", filepath)
     
     def save_maneuvers_to_csv(self, filename: str = 'maneuvers_log.csv') -> None:
         """Save maneuver logs to CSV."""
@@ -92,6 +114,7 @@ class SimulationLogger:
         df = pd.DataFrame(self.maneuvers)
         df.to_csv(filepath, index=False)
         print(f"Saved maneuvers log to {filepath}")
+        LOGGER.info("Saved maneuvers log to %s", filepath)
 
 
 class SimulationRunner:
@@ -116,10 +139,12 @@ class SimulationRunner:
                  initial_fuel_kg: float = 1000.0,
                  max_fuel_kg: float = 1000.0,
                  near_miss_distance_km: Optional[float] = None,
-                 secondary_conjunction_risk_threshold: float = 0.5,
+                 secondary_conjunction_risk_threshold: float = 0.01,
                  policy_kwargs: Optional[Dict] = None,
                  marl_trainer: Optional[object] = None,
-                 scenario_config: Optional[Dict[str, Any]] = None):
+                 scenario_config: Optional[Dict[str, Any]] = None,
+                 hard_scenario_probability: float = 0.0,
+                 realism_config: Optional[RealismConfig] = None):
         """
         Initialize simulation runner.
         
@@ -137,6 +162,7 @@ class SimulationRunner:
         self.policy_kwargs = policy_kwargs or {}
         self.marl_trainer = marl_trainer
         self.scenario_config = scenario_config
+        self.hard_scenario_probability = float(hard_scenario_probability)
         
         # Environment
         self.env = MultiAgentOrbitalEnv(
@@ -153,6 +179,8 @@ class SimulationRunner:
             near_miss_distance_km=near_miss_distance_km,
             secondary_conjunction_risk_threshold=secondary_conjunction_risk_threshold,
             scenario_config=scenario_config,
+            hard_scenario_probability=self.hard_scenario_probability,
+            realism_config=realism_config,
         )
         
         # Safety filter
@@ -160,7 +188,10 @@ class SimulationRunner:
         self.safety_filter = None
         if use_safety_filter:
             self.safety_filter = CBFSafetyFilter(
-                min_safe_distance_km=safety_threshold_km
+                min_safe_distance_km=safety_threshold_km,
+                alpha=float(self.policy_kwargs.get("cbf_alpha", 0.8)),
+                time_horizon_s=float(self.policy_kwargs.get("cbf_time_horizon_s", 1200.0)),
+                risk_threshold=float(self.policy_kwargs.get("cbf_risk_threshold", 0.35)),
             )
         
         # Policy manager
@@ -204,7 +235,7 @@ class SimulationRunner:
             self.policy_manager.register_policy('marl', MARLPolicy(self.marl_trainer))
     
     def run_episode(self, max_steps: int = 1000,
-                   verbose: bool = True) -> Dict:
+                    verbose: bool = True) -> Dict:
         """
         Run one complete episode.
         
@@ -215,6 +246,17 @@ class SimulationRunner:
         Returns:
             Episode statistics
         """
+        if LOGGER.isEnabledFor(logging.DEBUG):
+            LOGGER.debug(
+                "Starting episode | policy=%s | sats=%d | debris=%d | dt=%.2fs | max_steps=%d | high_risk=%s",
+                getattr(self.policy_manager, "active_policy", None),
+                int(getattr(self.env, "num_satellites", -1)),
+                int(getattr(self.env, "num_debris", -1)),
+                float(getattr(self.env, "dt", float("nan"))),
+                int(max_steps),
+                bool(getattr(self.env, "high_risk_mode", False)),
+            )
+
         # Reset environment
         observations = self.env.reset()
         
@@ -226,6 +268,8 @@ class SimulationRunner:
             'total_secondary_conjunctions': 0,
             'total_near_misses': 0,
             'min_separation_distance_km': float("inf"),
+            'efficiency_score': 0.0,
+            'tc8_active': False,
             'final_step': 0,
         }
         
@@ -235,14 +279,14 @@ class SimulationRunner:
 
             # Keep action dict scoped to active satellite agents only.
             actions = {
-                agent_id: int(actions.get(agent_id, 0))
+                agent_id: actions.get(agent_id, 0)
                 for agent_id in self.env.agent_ids_ordered[: self.env.num_satellites]
                 if agent_id in observations
             }
             
             # Apply safety filter if enabled
             if self.use_safety_filter:
-                actions = self._apply_safety_filter(actions, observations)
+                actions = self._apply_safety_filter(actions)
             
             # Step environment
             next_obs, rewards, dones, info = self.env.step(actions)
@@ -253,7 +297,11 @@ class SimulationRunner:
                     step,
                     info['collisions_this_step'],
                     self.env.episode_fuel_used,
-                    info['alerts_count']
+                    info['alerts_count'],
+                    min_distance_m=float(info.get('min_distance_m', float('inf'))),
+                    max_risk=float(info.get('max_risk_this_step', 0.0)),
+                    maneuver_count=int(info.get('maneuver_count', 0)),
+                    fuel_remaining=info.get('fuel_remaining'),
                 )
             
             # Update stats
@@ -264,6 +312,12 @@ class SimulationRunner:
             episode_stats['total_secondary_conjunctions'] = self.env.episode_secondary_conjunctions
             episode_stats['total_near_misses'] = self.env.episode_near_misses
             episode_stats['min_separation_distance_km'] = self.env.episode_min_separation_distance_km
+            episode_stats['tc8_active'] = bool(info.get('tc8_active', False))
+            episode_stats['efficiency_score'] = compute_efficiency_score(
+                episode_stats['total_collisions'],
+                episode_stats['total_fuel_used'],
+                episode_stats['total_maneuvers_executed'],
+            )
             
             # Update observations
             observations = next_obs
@@ -276,11 +330,39 @@ class SimulationRunner:
                 episode_stats['final_step'] = max_steps - 1
             
             if verbose and (step + 1) % 100 == 0:
-                print(f"Step {step + 1}/{max_steps} - "
-                      f"Collisions: {info['episode_collisions']}, "
-                      f"Fuel: {self.env.episode_fuel_used:.2f} kg, "
-                      f"Alerts: {info['alerts_count']}")
+                msg = (
+                    f"Step {step + 1}/{max_steps} - "
+                    f"Collisions: {info['episode_collisions']}, "
+                    f"Fuel: {self.env.episode_fuel_used:.2f} kg, "
+                    f"Alerts: {info['alerts_count']}"
+                )
+                print(msg)
+                LOGGER.info("%s", msg)
+
+            if LOGGER.isEnabledFor(logging.DEBUG) and (step + 1) % 100 == 0:
+                LOGGER.debug(
+                    "Progress step=%d/%d | collisions=%s | fuel=%.3f | maneuvers=%s | secondary=%s | near_misses=%s | min_sep_km=%.6f",
+                    int(step + 1),
+                    int(max_steps),
+                    info.get("episode_collisions"),
+                    float(getattr(self.env, "episode_fuel_used", 0.0)),
+                    getattr(self.env, "episode_maneuvers_executed", None),
+                    getattr(self.env, "episode_secondary_conjunctions", None),
+                    getattr(self.env, "episode_near_misses", None),
+                    float(getattr(self.env, "episode_min_separation_distance_km", float("nan"))),
+                )
         
+        if LOGGER.isEnabledFor(logging.DEBUG):
+            LOGGER.debug(
+                "Completed episode | collisions=%s | fuel=%.4f | maneuvers=%s | secondary=%s | near_misses=%s | final_step=%s",
+                episode_stats.get("total_collisions"),
+                float(episode_stats.get("total_fuel_used", 0.0)),
+                episode_stats.get("total_maneuvers_executed"),
+                episode_stats.get("total_secondary_conjunctions"),
+                episode_stats.get("total_near_misses"),
+                episode_stats.get("final_step"),
+            )
+
         return episode_stats
 
     def run_scenario(
@@ -340,67 +422,64 @@ class SimulationRunner:
 
         return all_stats
     
-    def _apply_safety_filter(self, actions: Dict[str, int],
-                            observations: Dict[str, np.ndarray]) -> Dict[str, int]:
+    def _apply_safety_filter(self, actions: Dict[str, Any]) -> Dict[str, Any]:
         """
         Apply CBF safety filter to actions.
         
         Args:
             actions: Raw policy actions
-            observations: Current observations
-            
         Returns:
             Filtered actions
         """
         filtered_actions = {}
-        
+
         for agent_id, action in actions.items():
-            if agent_id not in observations:
+            agent_state = self.env.agents.get(agent_id)
+            if agent_state is None or agent_state.orbital_state is None:
                 filtered_actions[agent_id] = action
                 continue
-            
-            obs = observations[agent_id]
-            
-            # Extract state
-            own_state = obs[:6]  # [x, y, z, vx, vy, vz]
-            
-            # Get nearby objects
-            nearby_start = 8
-            nearby_objects = {}
-            for i in range(7):
-                obj_start = nearby_start + i * 8
-                if obj_start + 8 <= len(obs):
-                    obj_state = obs[obj_start:obj_start+6]
-                    if not (np.allclose(obj_state[:3], 0) and np.allclose(obj_state[3:], 0)):
-                        nearby_objects[f"OBJ_{i}"] = obj_state
-            
-            # Convert action to delta-v
-            action_dv = self.env.maneuver_engine.action_index_to_delta_v(
-                action, own_state[3:]
-            )
-            
-            # Filter through CBF
+
+            own_state = agent_state.orbital_state.to_array()
+            threats = self.env.get_agent_threats(agent_id)
+            if isinstance(action, (list, tuple)):
+                dir_idx = action[0]
+                mag = action[1]
+                man_type = self.env.maneuver_engine.get_discrete_action_space().get(dir_idx)
+                if man_type:
+                    action_dv = self.env.maneuver_engine._get_maneuver_direction(own_state[3:], man_type) * mag
+                else:
+                    action_dv = np.zeros(3, dtype=np.float64)
+            else:
+                action_dv = self.env.maneuver_engine.action_index_to_delta_v(
+                    int(action),
+                    own_state[3:],
+                )
             safe_dv = self.safety_filter.filter_action(
-                own_state, action_dv, nearby_objects
+                own_state,
+                action_dv,
+                threats,
+                max_dv=self.env.maneuver_engine.max_delta_v,
             )
-            
-            # Check if action changed
+
             if not np.allclose(safe_dv, action_dv):
-                # Action was modified - find closest valid discrete action
                 best_action = 0
                 min_dist = float('inf')
-                for a_idx in range(6):
+                for a_idx in range(self.env.action_space[0]):
                     test_dv = self.env.maneuver_engine.action_index_to_delta_v(
-                        a_idx, own_state[3:]
+                        a_idx,
+                        own_state[3:],
                     )
                     dist = np.linalg.norm(safe_dv - test_dv)
                     if dist < min_dist:
                         min_dist = dist
                         best_action = a_idx
-                filtered_actions[agent_id] = best_action
+                if best_action == 0:
+                    filtered_actions[agent_id] = 0
+                else:
+                    filtered_actions[agent_id] = (best_action, float(np.linalg.norm(safe_dv)))
             else:
                 filtered_actions[agent_id] = action
-        
+
         return filtered_actions
     
     def compare_policies(self, policies: List[str],
@@ -444,6 +523,7 @@ class SimulationRunner:
                 maneuver_log_filename=f"{policy_name}_maneuvers_log.csv",
             )
 
+
             # Aggregate statistics
             results[policy_name] = self._aggregate_stats(stats_list)
 
@@ -458,6 +538,12 @@ class SimulationRunner:
         fuel = [s['total_fuel_used'] for s in stats_list]
         maneuvers = [s.get('total_maneuvers_executed', 0) for s in stats_list]
         secondary = [s.get('total_secondary_conjunctions', 0) for s in stats_list]
+        near_misses = [s.get('total_near_misses', 0) for s in stats_list]
+        efficiency_scores = [s.get('efficiency_score', compute_efficiency_score(
+            s.get('total_collisions', 0),
+            s.get('total_fuel_used', 0.0),
+            s.get('total_maneuvers_executed', 0),
+        )) for s in stats_list]
         
         collision_free = np.array([1 if c == 0 else 0 for c in collisions], dtype=float)
         collision_light = np.array([1 if c <= 1 else 0 for c in collisions], dtype=float)
@@ -465,10 +551,13 @@ class SimulationRunner:
         return {
             'mean_collisions': np.mean(collisions),
             'std_collisions': np.std(collisions),
+            'collision_rate': float(1.0 - collision_free.mean()),
             'mean_fuel': np.mean(fuel),
             'std_fuel': np.std(fuel),
             'mean_maneuvers_executed': np.mean(maneuvers),
             'mean_secondary_conjunctions': np.mean(secondary),
+            'mean_near_misses': np.mean(near_misses),
+            'mean_efficiency_score': np.mean(efficiency_scores),
             'success_rate': float(collision_free.mean()),
             'success_rate_<=1_collision': float(collision_light.mean()),
             'avg_episode_length': np.mean([s['final_step'] for s in stats_list]),

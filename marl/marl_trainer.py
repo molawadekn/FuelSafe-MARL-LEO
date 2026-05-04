@@ -6,61 +6,80 @@ Implements a lightweight MAPPO-style trainer with centralized critic input.
 from __future__ import annotations
 
 from collections import deque
-from typing import Deque, Dict, List, Optional, Tuple
+from typing import Any, Deque, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
 
+from sim.maneuver_engine import ACTION_COUNT, MAX_DELTA_V_PER_STEP_KMS
+from sim.observation_utils import OBS_SIZE
+
 
 class ActorNetwork(nn.Module):
-    """Actor network (policy network) for MAPPO."""
+    """Actor network (policy network) for MAPPO, updated for Hybrid Action Space."""
 
-    def __init__(self, input_size: int = 64, output_size: int = 6, hidden_size: int = 64):
+    def __init__(self, input_size: int = OBS_SIZE, output_size: int = ACTION_COUNT, hidden_size: int = 128):
         super().__init__()
-        self.net = nn.Sequential(
+        self.shared = nn.Sequential(
             nn.Linear(input_size, hidden_size),
             nn.ReLU(),
             nn.Linear(hidden_size, hidden_size),
             nn.ReLU(),
-            nn.Linear(hidden_size, output_size),
+            nn.Linear(hidden_size, hidden_size),
+            nn.ReLU(),
         )
+        self.direction_head = nn.Linear(hidden_size, output_size)
+        self.magnitude_mean_head = nn.Sequential(
+            nn.Linear(hidden_size, 1),
+            nn.Sigmoid()
+        )
+        self.magnitude_logstd = nn.Parameter(torch.tensor([np.log(5.0e-4)], dtype=torch.float32))
+        self.max_dv = float(MAX_DELTA_V_PER_STEP_KMS)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Return action logits."""
-        return self.net(x)
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        features = self.shared(x)
+        logits = self.direction_head(features)
+        mag_mean = self.magnitude_mean_head(features) * self.max_dv
+        return logits, mag_mean
 
-    def distribution(self, x: torch.Tensor) -> torch.distributions.Categorical:
-        """Return a categorical distribution over discrete actions."""
-        logits = self.forward(x)
-        return torch.distributions.Categorical(logits=logits)
+    def distribution(self, x: torch.Tensor) -> Tuple[torch.distributions.Categorical,  torch.distributions.Normal]:
+        logits, mag_mean = self.forward(x)
+        dir_dist = torch.distributions.Categorical(logits=logits)
+        mag_std = torch.exp(self.magnitude_logstd).clamp(min=5.0e-5, max=1.5e-3).expand_as(mag_mean)
+        mag_dist = torch.distributions.Normal(mag_mean, mag_std)
+        return dir_dist, mag_dist
 
     def get_action(
         self, state: np.ndarray, device: str = "cpu", deterministic: bool = False
-    ) -> Tuple[int, float]:
-        """Sample or greedily select an action and return its log-probability."""
+    ) -> Tuple[Tuple[int, float], float]:
         with torch.no_grad():
             state_tensor = torch.as_tensor(state, dtype=torch.float32, device=device).unsqueeze(0)
-            dist = self.distribution(state_tensor)
+            dir_dist, mag_dist = self.distribution(state_tensor)
 
             if deterministic:
-                action = torch.argmax(dist.probs, dim=-1)
+                dir_action = torch.argmax(dir_dist.probs, dim=-1)
+                mag_action = mag_dist.mean
             else:
-                action = dist.sample()
+                dir_action = dir_dist.sample()
+                mag_action = mag_dist.sample()
 
-            log_prob = dist.log_prob(action)
+            mag_action = torch.clamp(mag_action, 0.0, self.max_dv)
+            log_prob = dir_dist.log_prob(dir_action) + mag_dist.log_prob(mag_action).squeeze(-1)
 
-        return int(action.item()), float(log_prob.item())
+        return (int(dir_action.item()), float(mag_action.item())), float(log_prob.item())
 
 
 class CriticNetwork(nn.Module):
     """Centralized critic over concatenated agent observations."""
 
-    def __init__(self, input_size: int = 64 * 3, hidden_size: int = 64):
+    def __init__(self, input_size: int = OBS_SIZE * 3, hidden_size: int = 128):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(input_size, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, hidden_size),
             nn.ReLU(),
             nn.Linear(hidden_size, hidden_size),
             nn.ReLU(),
@@ -78,7 +97,7 @@ class PPOBuffer:
         self.buffer_size = buffer_size
         self.obs: Deque[np.ndarray] = deque(maxlen=buffer_size)
         self.central_obs: Deque[np.ndarray] = deque(maxlen=buffer_size)
-        self.actions: Deque[int] = deque(maxlen=buffer_size)
+        self.actions: Deque[np.ndarray] = deque(maxlen=buffer_size)
         self.rewards: Deque[float] = deque(maxlen=buffer_size)
         self.dones: Deque[float] = deque(maxlen=buffer_size)
         self.log_probs: Deque[float] = deque(maxlen=buffer_size)
@@ -89,7 +108,7 @@ class PPOBuffer:
         self,
         obs: np.ndarray,
         central_obs: np.ndarray,
-        action: int,
+        action: Tuple[int, float],
         reward: float,
         done: bool,
         log_prob: float,
@@ -98,7 +117,7 @@ class PPOBuffer:
     ) -> None:
         self.obs.append(np.asarray(obs, dtype=np.float32))
         self.central_obs.append(np.asarray(central_obs, dtype=np.float32))
-        self.actions.append(int(action))
+        self.actions.append(np.asarray(action, dtype=np.float32))
         self.rewards.append(float(reward))
         self.dones.append(float(done))
         self.log_probs.append(float(log_prob))
@@ -122,7 +141,7 @@ class PPOBuffer:
         return {
             "obs": np.asarray(self.obs, dtype=np.float32),
             "central_obs": np.asarray(self.central_obs, dtype=np.float32),
-            "actions": np.asarray(self.actions, dtype=np.int64),
+            "actions": np.asarray(self.actions, dtype=np.float32),
             "rewards": np.asarray(self.rewards, dtype=np.float32),
             "dones": np.asarray(self.dones, dtype=np.float32),
             "log_probs": np.asarray(self.log_probs, dtype=np.float32),
@@ -139,10 +158,10 @@ class MARLTrainer:
     def __init__(
         self,
         num_agents: int = 3,
-        obs_size: int = 64,
-        action_size: int = 6,
-        hidden_size: int = 64,
-        learning_rate: float = 1e-3,
+        obs_size: int = OBS_SIZE,
+        action_size: int = ACTION_COUNT,
+        hidden_size: int = 128,
+        learning_rate: float = 3e-4,
         gamma: float = 0.99,
         gae_lambda: float = 0.95,
         entropy_coeff: float = 0.01,
@@ -178,6 +197,10 @@ class MARLTrainer:
         self.buffers = {agent_id: PPOBuffer() for agent_id in self.actors.keys()}
         self.training_stats: List[Dict[str, float]] = []
 
+    def set_entropy(self, coeff: float) -> None:
+        """Update entropy coefficient for scheduled annealing."""
+        self.entropy_coeff = float(coeff)
+
     def _build_central_observation(self, observations: Dict[str, np.ndarray]) -> np.ndarray:
         """Concatenate observations in a stable agent order for the centralized critic."""
         central_obs = []
@@ -195,20 +218,21 @@ class MARLTrainer:
             ).unsqueeze(0)
             return float(self.critic(central_obs_t).item())
 
-    def _log_prob_for_action(self, actor: ActorNetwork, obs: np.ndarray, action: int) -> float:
+    def _log_prob_for_action(self, actor: ActorNetwork, obs: np.ndarray, action: Tuple[int, float]) -> float:
         with torch.no_grad():
             obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
-            action_t = torch.as_tensor([action], dtype=torch.long, device=self.device)
-            dist = actor.distribution(obs_t)
-            return float(dist.log_prob(action_t).item())
+            dir_action_t = torch.as_tensor([action[0]], dtype=torch.long, device=self.device)
+            mag_action_t = torch.as_tensor([[action[1]]], dtype=torch.float32, device=self.device)
+            dir_dist, mag_dist = actor.distribution(obs_t)
+            return float((dir_dist.log_prob(dir_action_t) + mag_dist.log_prob(mag_action_t).squeeze(-1)).item())
 
     def get_action_details(
         self, observations: Dict[str, np.ndarray], deterministic: bool = False
-    ) -> Tuple[Dict[str, int], Dict[str, float], float]:
+    ) -> Tuple[Dict[str, Any], Dict[str, float], float]:
         """
         Return joint actions, per-agent log-probs, and centralized value estimate.
         """
-        actions: Dict[str, int] = {}
+        actions: Dict[str, Any] = {}
         log_probs: Dict[str, float] = {}
         central_obs = self._build_central_observation(observations)
         value = self._critic_value(central_obs)
@@ -216,7 +240,7 @@ class MARLTrainer:
         for agent_id, actor in self.actors.items():
             obs = observations.get(agent_id)
             if obs is None:
-                actions[agent_id] = 0
+                actions[agent_id] = (0, 0.0)
                 log_probs[agent_id] = 0.0
                 continue
 
@@ -228,7 +252,7 @@ class MARLTrainer:
 
     def get_actions(
         self, observations: Dict[str, np.ndarray], deterministic: bool = False
-    ) -> Dict[str, int]:
+    ) -> Dict[str, Any]:
         actions, _, _ = self.get_action_details(observations, deterministic=deterministic)
         return actions
 
@@ -238,7 +262,7 @@ class MARLTrainer:
         rewards: Dict[str, float],
         next_observations: Dict[str, np.ndarray],
         dones: Dict[str, bool],
-        actions: Dict[str, int],
+        actions: Dict[str, Any],
         log_probs: Optional[Dict[str, float]] = None,
         central_value: Optional[float] = None,
     ) -> None:
@@ -257,7 +281,7 @@ class MARLTrainer:
             if obs is None:
                 continue
 
-            action = int(actions.get(agent_id, 0))
+            action = actions.get(agent_id, (0, 0.0))
             reward = float(rewards.get(agent_id, 0.0))
             done = bool(dones.get(agent_id, dones.get("__all__", False)))
 
@@ -297,7 +321,7 @@ class MARLTrainer:
         returns = advantages + values
         return advantages.astype(np.float32), returns.astype(np.float32)
 
-    def train(self, num_epochs: int = 3, batch_size: int = 64) -> Dict[str, float]:
+    def train(self, num_epochs: int = 10, batch_size: int = 128) -> Dict[str, float]:
         """Train all actors and the centralized critic using collected rollouts."""
         stats = {
             "actor_loss": 0.0,
@@ -326,7 +350,7 @@ class MARLTrainer:
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
             obs_t = torch.as_tensor(data["obs"], dtype=torch.float32, device=self.device)
-            actions_t = torch.as_tensor(data["actions"], dtype=torch.long, device=self.device)
+            actions_t = torch.as_tensor(data["actions"], dtype=torch.float32, device=self.device)
             old_log_probs_t = torch.as_tensor(
                 data["log_probs"], dtype=torch.float32, device=self.device
             )
@@ -347,9 +371,12 @@ class MARLTrainer:
                     batch_old_log_probs = old_log_probs_t[idx]
                     batch_advantages = advantages_t[idx]
 
-                    dist = actor.distribution(batch_obs)
-                    new_log_probs = dist.log_prob(batch_actions)
-                    entropy = dist.entropy().mean()
+                    dir_dist, mag_dist = actor.distribution(batch_obs)
+                    batch_dir_actions = batch_actions[:, 0].long()
+                    batch_mag_actions = batch_actions[:, 1].unsqueeze(-1)
+                    
+                    new_log_probs = dir_dist.log_prob(batch_dir_actions) + mag_dist.log_prob(batch_mag_actions).squeeze(-1)
+                    entropy = (dir_dist.entropy() + mag_dist.entropy().squeeze(-1)).mean()
 
                     ratio = torch.exp(new_log_probs - batch_old_log_probs)
                     surr1 = ratio * batch_advantages
@@ -426,9 +453,23 @@ class MARLTrainer:
     def load(self, filepath: str) -> None:
         """Load trained weights."""
         state_dict = torch.load(filepath, map_location=self.device)
+        
         saved_actors = state_dict.get("actors", {})
-        saved_actor_ids = sorted(saved_actors.keys())
+        
+        # Support for shared-actor checkpoints (where a single "actor" key is used)
+        if not saved_actors and "actor" in state_dict:
+            print(f"[INFO] Found shared 'actor' key in {filepath}. Broadcasting to all agents.")
+            shared_actor_state = state_dict["actor"]
+            for agent_id, actor in self.actors.items():
+                self._load_partial_state_dict(actor, shared_actor_state, label=f"actor[{agent_id}]")
+            
+            critic_state = state_dict.get("critic")
+            if critic_state:
+                self._load_partial_state_dict(self.critic, critic_state, label="critic")
+            return
 
+        # Original per-agent loading logic
+        saved_actor_ids = sorted(saved_actors.keys())
         if not saved_actor_ids:
             raise ValueError(f"No actor weights found in {filepath}")
 
@@ -439,7 +480,7 @@ class MARLTrainer:
             else:
                 source_id = saved_actor_ids[idx % len(saved_actor_ids)]
                 reused_actor_weights = True
-            actor.load_state_dict(saved_actors[source_id])
+            self._load_partial_state_dict(actor, saved_actors[source_id], label=f"actor[{agent_id}]")
 
         if reused_actor_weights:
             print(
@@ -448,14 +489,29 @@ class MARLTrainer:
             )
 
         critic_state = state_dict.get("critic")
-        current_critic_state = self.critic.state_dict()
-        critic_compatible = bool(
-            critic_state
-            and current_critic_state.keys() == critic_state.keys()
-            and all(current_critic_state[k].shape == critic_state[k].shape for k in current_critic_state)
-        )
-
-        if critic_compatible:
-            self.critic.load_state_dict(critic_state)
+        if critic_state:
+            self._load_partial_state_dict(self.critic, critic_state, label="critic")
         else:
-            print("[INFO] Skipping critic weights because the saved centralized critic shape does not match this trainer.")
+            print("[INFO] Skipping critic weights because none were found in the checkpoint.")
+
+    def _load_partial_state_dict(self, module: nn.Module, saved_state: Dict[str, torch.Tensor], label: str) -> None:
+        """Load only shape-compatible parameters from a checkpoint."""
+        current_state = module.state_dict()
+        compatible_state: Dict[str, torch.Tensor] = {}
+        skipped = []
+        for key, value in saved_state.items():
+            if key in current_state and current_state[key].shape == value.shape:
+                compatible_state[key] = value
+            else:
+                skipped.append(key)
+
+        if compatible_state:
+            merged_state = current_state.copy()
+            merged_state.update(compatible_state)
+            module.load_state_dict(merged_state)
+
+        if skipped:
+            print(
+                f"[INFO] Partially loaded {label}: "
+                f"{len(compatible_state)} tensors matched, {len(skipped)} skipped due to shape mismatch."
+            )

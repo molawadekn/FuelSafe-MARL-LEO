@@ -14,8 +14,6 @@ python -m venv .venv
 .venv\Scripts\python.exe main.py --demo --include-marl --episodes 1 --steps 50
 ```
 
-This runs baseline, rule-based, and MARL policy comparisons and writes logs under `outputs/`.
-
 ## 3. Launch the Local UI
 
 ```powershell
@@ -28,7 +26,22 @@ The UI lets you:
 - run any named test case from `TC1` to `TC8`
 - inspect generated CSVs with interactive Plotly charts
 
-## 4. Run the Reproducible Test Framework
+## 4. Train And Validate MARL Pipeline
+
+```powershell
+.venv\Scripts\python.exe train.py --max-episodes 8000 --max-steps 120 --update-every 5 --eval-interval 50 --eval-episodes 5 --tc8-ratio 0.25 --use-dataset true --dataset-path data\train_data.jsonl --dataset-eval-path data\test_data.jsonl --save-dir policies\saved_models
+```
+
+This uses:
+- curriculum stages with periodic hard TC8-like sampling
+- gradient updates every `--update-every` episodes
+- multi-objective evaluation every `--eval-interval` episodes (collisions, fuel, secondary conjunctions)
+
+Key outputs:
+- `policies/saved_models/mppo_final.pt`
+- intermediate checkpoints (e.g. `mppo_checkpoint_50.pt`)
+
+## 5. Run The Reproducible Test Framework
 
 ```powershell
 .venv\Scripts\python.exe experiments/run_collision_avoidance_tests.py --quick --mc-runs 3 --max-debris 200
@@ -37,46 +50,19 @@ The UI lets you:
 Useful variants:
 
 ```powershell
-# Single scenario family
-.venv\Scripts\python.exe experiments/run_collision_avoidance_tests.py --test-cases TC1_no_maneuver --mc-runs 10 --max-debris 200
-
 # Include MARL in the dedicated MARL and fuel-constrained cases
-.venv\Scripts\python.exe experiments/run_collision_avoidance_tests.py --test-cases TC4_marl,TC6_fuel_constrained --mc-runs 3 --max-debris 200 --include-marl --marl-untrained
+.venv\Scripts\python.exe experiments/run_collision_avoidance_tests.py --test-cases TC4_marl,TC6_fuel_constrained --mc-runs 3 --max-debris 200 --include-marl --marl-model-path policies\saved_models\mppo_final.pt
 
 # Synthetic high-collision comparison case
-.venv\Scripts\python.exe experiments/run_collision_avoidance_tests.py --test-cases TC8_hypothetical_collision_cluster --mc-runs 1 --max-debris 200 --include-marl --marl-model-path outputs\marl_train_validation\marl_trained_from_train_dataset.pth
+.venv\Scripts\python.exe experiments/run_collision_avoidance_tests.py --test-cases TC8_hypothetical_collision_cluster --mc-runs 3 --max-debris 200 --include-marl --marl-model-path policies\saved_models\mppo_final.pt --output-dir outputs\tc8_validation
+
+# Full named suite
+.venv\Scripts\python.exe experiments/run_collision_avoidance_tests.py --mc-runs 1 --max-debris 200 --include-marl --marl-model-path policies\saved_models\mppo_final.pt --output-dir outputs\test_framework_full_validation
 ```
 
-## 5. Train And Validate MARL From ESA CDM Data
+## 6. Notes
 
-```powershell
-.venv\Scripts\python.exe sim/dataset_integration.py --train-csv data\train_data.csv --test-csv data\test_data.csv --output-dir outputs\marl_train_validation --risk-threshold -7.0 --train-scenarios 12 --test-scenarios 8 --episodes-per-scenario 4 --max-steps 120 --num-satellites 3 --num-debris 10
-```
-
-Dataset-derived scenarios now parameterize the actual first satellite-debris encounter used during training and validation.
-
-Key outputs:
-- `outputs/marl_train_validation/marl_trained_from_train_dataset.pth`
-- `outputs/marl_train_validation/train_metrics.csv`
-- `outputs/marl_train_validation/validation_policy_summary.csv`
-- `outputs/marl_train_validation/train_validation_report.json`
-- `outputs/marl_train_validation/interactive_validation_summary_mean_fuel.html`
-
-## 6. Outputs
-
-Common files written by experiments:
-- `test_runs_per_policy.csv`
-- `aggregated_summary.csv`
-- `plot_mean_collisions.png`
-- `plot_mean_fuel.png`
-- `plot_mean_maneuvers.png`
-- `plot_mean_secondary_conjunctions.png`
-- `interactive_summary_mean_collisions.html`
-- `interactive_runs_total_fuel_used.html`
-
-## 7. Notes
-
-- Distances are in `km`.
-- Velocities are in `km/s`.
-- Fuel use is penalized using actual fuel burned per step, not just a flat action penalty.
-- Maneuver effects persist across steps through state offsets relative to the SGP4 reference orbit.
+- Observation size is `70`, heavily optimized mapping predictive geometry variables across a normalized array.
+- The discrete action space now has `7` actions and combines direction pushes using a hybrid continuous parameter generation limit.
+- Maneuvers are applied before propagation inside each step.
+- The reward mixes Probability of Collision (Pc) computing continuous geometric risk deltas + exponential TCA scaling.

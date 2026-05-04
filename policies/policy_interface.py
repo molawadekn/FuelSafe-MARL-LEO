@@ -3,278 +3,179 @@ MODULE 8: Plugin Policy Interface
 Enables pluggable policy comparison (baseline vs MARL).
 """
 
-import numpy as np
+from __future__ import annotations
+
 from abc import ABC, abstractmethod
 from enum import Enum
-from typing import Dict
+from typing import Any, Dict, List, Optional, Tuple, Union
+
+import numpy as np
+
+from sim.maneuver_engine import ACTION_COUNT, EMERGENCY_ACTION_INDEX
+from sim.observation_utils import ThreatObservation, decode_observation, rank_threats
 
 
 class PolicyType(Enum):
     """Types of available policies."""
+
     BASELINE = "baseline"
     MARL = "marl"
     RANDOM = "random"
     RULE_BASED = "rule_based"
 
 
+def _decoded_float(decoded: Dict[str, object], key: str, default: float = 0.0) -> float:
+    value = decoded.get(key, default)
+    if isinstance(value, (int, float, np.floating)):
+        return float(value)
+    return float(default)
+
+
+def _decoded_threats(decoded: Dict[str, object]) -> List[ThreatObservation]:
+    value = decoded.get("threats", [])
+    if not isinstance(value, list):
+        return []
+    return [threat for threat in value if isinstance(threat, ThreatObservation)]
+
+
+def _decoded_safe_risk_threshold(decoded: Dict[str, object]) -> float:
+    min_tca_top3_s = _decoded_float(decoded, "min_tca_top3_s", 3600.0)
+    return float(max(0.001, 0.02 * np.exp(-max(0.0, min_tca_top3_s) / 300.0)))
+
+
+def _is_emergency_threat(
+    threat: ThreatObservation,
+    *,
+    risk_threshold: float,
+    tca_threshold_s: float,
+    miss_distance_threshold_km: float,
+) -> bool:
+    return bool(
+        threat.risk_score >= risk_threshold
+        or threat.time_to_closest_approach_s <= tca_threshold_s
+        or threat.miss_distance_estimate_km <= miss_distance_threshold_km
+    )
+
+
+def _directional_action_for_threat(threat: ThreatObservation) -> int:
+    rel_pos = np.asarray(threat.rel_pos, dtype=np.float64)
+    dominant_axis = int(np.argmax(np.abs(rel_pos))) if rel_pos.size else 0
+
+    if dominant_axis == 0:
+        return 3 if rel_pos[0] >= 0.0 else 4
+    if dominant_axis == 1:
+        return 2 if rel_pos[1] >= 0.0 else 1
+    return 5
+
+
+def _select_avoidance_action(
+    threat: ThreatObservation,
+    *,
+    emergency_risk_threshold: float,
+    emergency_tca_threshold_s: float,
+    emergency_miss_distance_km: float,
+) -> int:
+    if _is_emergency_threat(
+        threat,
+        risk_threshold=emergency_risk_threshold,
+        tca_threshold_s=emergency_tca_threshold_s,
+        miss_distance_threshold_km=emergency_miss_distance_km,
+    ):
+        return EMERGENCY_ACTION_INDEX
+    return _directional_action_for_threat(threat)
+
+
 class BasePolicy(ABC):
     """Abstract base class for policies."""
-    
+
     @abstractmethod
-    def select_action(self, state: np.ndarray, agent_id: str) -> int:
-        """
-        Select action given state.
-        
-        Args:
-            state: Observation/state
-            agent_id: Agent identifier
-            
-        Returns:
-            Action index (0-5)
-        """
-        pass
-    
+    def select_action(self, state: np.ndarray, agent_id: str) -> Union[int, Tuple[int, float]]:
+        """Select action given state."""
+
     @abstractmethod
     def reset(self):
         """Reset policy state."""
-        pass
 
-    def select_actions(self, observations: Dict[str, np.ndarray]) -> Dict[str, int]:
-        """
-        Select actions for a full observation dict.
-
-        Policies that need joint context can override this method. The default
-        behavior preserves the existing per-agent interface.
-        """
+    def select_actions(self, observations: Dict[str, np.ndarray]) -> Dict[str, Union[int, Tuple[int, float]]]:
+        """Select actions for a full observation dict."""
         return {
             agent_id: self.select_action(state, agent_id)
             for agent_id, state in observations.items()
         }
-    
+
     def name(self) -> str:
-        """Return policy name."""
         return self.__class__.__name__
 
 
 class BaselinePolicy(BasePolicy):
-    """
-    Baseline heuristic policy.
-    
-    Rule:
-    - If high-risk conjunction ahead: execute avoidance maneuver
-    - Otherwise: no-op
-    """
-    
+    """Simple risk-threshold heuristic using the shared threat features."""
+
     def __init__(self, risk_threshold: float = 0.5):
-        """
-        Initialize baseline policy.
-        
-        Args:
-            risk_threshold: Risk score threshold for action
-        """
-        self.risk_threshold = risk_threshold
-        self.last_risks = {}
-    
+        self.risk_threshold = float(risk_threshold)
+        self.last_risks: Dict[str, float] = {}
+
     def select_action(self, state: np.ndarray, agent_id: str) -> int:
-        """
-        Select action using simple heuristic.
-        
-        State format: [pos(3), vel(3), fuel_ratio, steps_norm, nearby_objects(56)]
-        
-        Args:
-            state: Observation
-            agent_id: Agent identifier
-            
-        Returns:
-            Action (0: no-op, 1-5: maneuvers)
-        """
-        if len(state) < 10:
-            return 0  # No-op
-        
-        # Extract own state
-        own_pos = state[:3]
-        own_vel = state[3:6]
-        fuel_ratio = state[6]
-        
-        # If out of fuel, no-op
-        if fuel_ratio < 0.05:
-            return 0
-        
-        # Check nearby objects (starting at index 8)
-        nearby_start = 8
-        max_risk = 0.0
-        closest_distance = float('inf')
-        closest_relative_pos = np.zeros(3)
-        
-        # Scan nearby objects
-        for i in range(7):  # Max 7 nearby objects
-            obj_start = nearby_start + i * 8
-            if obj_start + 8 > len(state):
-                break
-            
-            obj_pos = state[obj_start:obj_start+3]
-            obj_vel = state[obj_start+3:obj_start+6]
-            
-            # Skip zero objects (empty slots)
-            if np.allclose(obj_pos, 0) and np.allclose(obj_vel, 0):
-                continue
-            
-            # Compute distance and relative velocity
-            rel_pos = obj_pos - own_pos
-            rel_vel = obj_vel - own_vel
-            distance = np.linalg.norm(rel_pos)
-            rel_speed = np.linalg.norm(rel_vel)
-            
-            # Estimate risk (simplified)
-            risk = 1.0 - np.clip(distance / 100.0, 0, 1)  # Higher risk if closer
-            
-            if risk > max_risk:
-                max_risk = risk
-                closest_distance = distance
-                closest_relative_pos = rel_pos
-        
+        decoded = decode_observation(state)
+        fuel_ratio = _decoded_float(decoded, "fuel_ratio", 0.0)
+        max_risk = _decoded_float(decoded, "max_risk", 0.0)
+        combined_risk_top3 = _decoded_float(decoded, "combined_risk_top3", 0.0)
+        threats = rank_threats(_decoded_threats(decoded))
+        safe_risk = _decoded_safe_risk_threshold(decoded)
+
         self.last_risks[agent_id] = max_risk
-        
-        # Decision logic
-        if max_risk < self.risk_threshold:
-            return 0  # No-op
-        
-        # If collision risk, choose maneuver based on relative geometry
-        # Simplified: use radial out maneuver (away from Earth)
-        if closest_distance < 1.0:
-            return 3  # RADIAL_OUT
-        elif closest_relative_pos[0] > 0:
-            return 1  # PROGRADE (move away)
-        else:
-            return 2  # RETROGRADE
-    
+        if fuel_ratio < 0.05 or not threats or (combined_risk_top3 <= safe_risk and max_risk < self.risk_threshold):
+            return 0
+
+        return _select_avoidance_action(
+            threats[0],
+            emergency_risk_threshold=0.92,
+            emergency_tca_threshold_s=120.0,
+            emergency_miss_distance_km=1.25,
+        )
+
     def reset(self):
-        """Reset policy."""
         self.last_risks = {}
 
 
 class RuleBasedPolicy(BasePolicy):
-    """
-    Advanced rule-based policy with multiple strategies.
-    Uses more sophisticated decision logic than baseline.
-    """
-    
+    """More aggressive heuristic that prioritizes high-risk / short-TCA threats."""
+
     def __init__(self, aggression: float = 0.5):
-        """
-        Initialize rule-based policy.
-        
-        Args:
-            aggression: How aggressively to maneuver (0-1)
-        """
-        self.aggression = np.clip(aggression, 0, 1)
-        self.maneuver_history = {}
-    
+        self.aggression = float(np.clip(aggression, 0.0, 1.0))
+        self.maneuver_history: Dict[str, int] = {}
+
     def select_action(self, state: np.ndarray, agent_id: str) -> int:
-        """
-        Select action using rule-based strategy.
-        
-        Args:
-            state: Observation
-            agent_id: Agent identifier
-            
-        Returns:
-            Action index
-        """
-        if len(state) < 10:
+        decoded = decode_observation(state)
+        fuel_ratio = _decoded_float(decoded, "fuel_ratio", 0.0)
+        combined_risk_top3 = _decoded_float(decoded, "combined_risk_top3", 0.0)
+        threats = rank_threats(_decoded_threats(decoded))
+        safe_risk = _decoded_safe_risk_threshold(decoded)
+
+        if fuel_ratio < 0.05 or not threats:
             return 0
-        
-        own_pos = state[:3]
-        own_vel = state[3:6]
-        fuel_ratio = state[6]
-        
-        if fuel_ratio < 0.05:
+
+        primary = threats[0]
+        risk_gate = 0.35 - 0.15 * self.aggression
+        if combined_risk_top3 <= safe_risk and primary.risk_score < risk_gate and primary.distance_km > 10.0:
             return 0
-        
-        # Analyze nearby objects
-        nearby_start = 8
-        threats = []
-        
-        for i in range(7):
-            obj_start = nearby_start + i * 8
-            if obj_start + 8 > len(state):
-                break
-            
-            obj_pos = state[obj_start:obj_start+3]
-            obj_vel = state[obj_start+3:obj_start+6]
-            
-            if np.allclose(obj_pos, 0) and np.allclose(obj_vel, 0):
-                continue
-            
-            rel_pos = obj_pos - own_pos
-            rel_vel = obj_vel - own_vel
-            distance = np.linalg.norm(rel_pos)
-            
-            # Estimate TCA (time to closest approach)
-            dot_rv = np.dot(rel_pos, rel_vel)
-            dot_vv = np.dot(rel_vel, rel_vel)
-            
-            if dot_vv > 1e-8:
-                tca = -dot_rv / dot_vv
-                if 0 < tca < 3600:  # Next hour
-                    threats.append({
-                        'distance': distance,
-                        'tca': tca,
-                        'rel_pos': rel_pos,
-                        'rel_vel': rel_vel
-                    })
-        
-        if not threats:
-            # If there are nearby objects (within 30 km) but not qualifying as TCA threat,
-            # use a low-level avoidance action to promote non-zero maneuvering.
-            nearby_close = []
-            nearby_start = 8
-            for i in range(7):
-                obj_start = nearby_start + i * 8
-                if obj_start + 8 > len(state):
-                    break
 
-                obj_pos = state[obj_start:obj_start+3]
-                obj_vel = state[obj_start+3:obj_start+6]
-                if np.allclose(obj_pos, 0) and np.allclose(obj_vel, 0):
-                    continue
+        emergency_risk = 0.8 - 0.1 * self.aggression
+        emergency_tca = 240.0 - 120.0 * self.aggression
+        emergency_miss_distance = 1.5 - 0.5 * self.aggression
 
-                distance = np.linalg.norm(obj_pos - own_pos)
-                if distance < 30.0:
-                    nearby_close.append(distance)
-
-            if nearby_close and fuel_ratio > 0.1:
-                return 1  # prograde small correction
-
+        if fuel_ratio < (0.35 if self.aggression > 0.7 else 0.1) and primary.risk_score < 0.9:
             return 0
-        
-        # Sort by urgency (TCA / distance)
-        threats.sort(key=lambda t: t['tca'] / (t['distance'] + 0.1))
-        primary_threat = threats[0]
-        
-        # Choose maneuver based on threat geometry and aggression
-        distance = primary_threat['distance']
-        tca = primary_threat['tca']
-        rel_pos = primary_threat['rel_pos']
-        
-        # More aggressive with lower fuel threshold
-        fuel_limit = 0.4 if self.aggression > 0.7 else 0.1
-        
-        if fuel_ratio < fuel_limit:
-            return 0  # Conserve fuel
-        
-        # Select maneuver
-        if distance < 0.5 and tca < 300:
-            # Imminent threat - aggressive maneuver
-            return 3  # RADIAL_OUT
-        elif rel_pos[0] < 0:
-            # Object ahead - go prograde
-            return 1  # PROGRADE
-        else:
-            # Object behind - go retrograde
-            return 2  # RETROGRADE
-    
+
+        action = _select_avoidance_action(
+            primary,
+            emergency_risk_threshold=emergency_risk,
+            emergency_tca_threshold_s=max(60.0, emergency_tca),
+            emergency_miss_distance_km=max(0.75, emergency_miss_distance),
+        )
+        self.maneuver_history[agent_id] = action
+        return action
+
     def reset(self):
-        """Reset policy."""
         self.maneuver_history = {}
 
 
@@ -289,43 +190,30 @@ class NoOpPolicy(BasePolicy):
 
 
 class ThresholdRulePolicy(BasePolicy):
-    """
-    Simple threshold-based deterministic rule.
-
-    If any nearby object is within `threshold_km`, execute `dv_action`
-    (e.g., PROGRADE) else NO_OP.
-    """
+    """Distance-threshold rule with emergency escalation for imminent threats."""
 
     def __init__(self, threshold_km: float = 5.0, dv_action: int = 1):
         self.threshold_km = float(threshold_km)
         self.dv_action = int(dv_action)
 
     def select_action(self, state: np.ndarray, agent_id: str) -> int:
-        if len(state) < 10:
+        decoded = decode_observation(state)
+        threats = rank_threats(_decoded_threats(decoded))
+        if not threats:
             return 0
 
-        own_pos = state[:3]
-
-        nearby_start = 8
-        min_distance = float("inf")
-
-        for i in range(7):
-            obj_start = nearby_start + i * 8
-            if obj_start + 8 > len(state):
-                break
-
-            obj_pos = state[obj_start : obj_start + 3]
-            obj_vel = state[obj_start + 3 : obj_start + 6]
-
-            # Empty slots are encoded as zeros.
-            if np.allclose(obj_pos, 0) and np.allclose(obj_vel, 0):
-                continue
-
-            dist = np.linalg.norm(obj_pos - own_pos)
-            if dist < min_distance:
-                min_distance = dist
-
-        if min_distance < self.threshold_km:
+        primary = threats[0]
+        if (
+            primary.distance_km < self.threshold_km
+            or primary.miss_distance_estimate_km < self.threshold_km
+        ):
+            if _is_emergency_threat(
+                primary,
+                risk_threshold=0.9,
+                tca_threshold_s=180.0,
+                miss_distance_threshold_km=max(1.0, 0.5 * self.threshold_km),
+            ):
+                return EMERGENCY_ACTION_INDEX
             return self.dv_action
         return 0
 
@@ -334,9 +222,7 @@ class ThresholdRulePolicy(BasePolicy):
 
 
 class FuelAwareThresholdRulePolicy(BasePolicy):
-    """
-    Distance-threshold rule gated by minimum remaining fuel.
-    """
+    """Distance-threshold rule gated by minimum remaining fuel."""
 
     def __init__(
         self,
@@ -349,35 +235,27 @@ class FuelAwareThresholdRulePolicy(BasePolicy):
         self.min_fuel_ratio = float(min_fuel_ratio)
 
     def select_action(self, state: np.ndarray, agent_id: str) -> int:
-        if len(state) < 10:
-            return 0
-
-        own_pos = state[:3]
-        fuel_ratio = float(state[6])
-
-        # Conserve fuel if below threshold.
+        decoded = decode_observation(state)
+        fuel_ratio = _decoded_float(decoded, "fuel_ratio", 0.0)
         if fuel_ratio <= self.min_fuel_ratio:
             return 0
 
-        nearby_start = 8
-        min_distance = float("inf")
+        threats = rank_threats(_decoded_threats(decoded))
+        if not threats:
+            return 0
 
-        for i in range(7):
-            obj_start = nearby_start + i * 8
-            if obj_start + 8 > len(state):
-                break
-
-            obj_pos = state[obj_start : obj_start + 3]
-            obj_vel = state[obj_start + 3 : obj_start + 6]
-
-            if np.allclose(obj_pos, 0) and np.allclose(obj_vel, 0):
-                continue
-
-            dist = np.linalg.norm(obj_pos - own_pos)
-            if dist < min_distance:
-                min_distance = dist
-
-        if min_distance < self.threshold_km:
+        primary = threats[0]
+        if (
+            primary.distance_km < self.threshold_km
+            or primary.miss_distance_estimate_km < self.threshold_km
+        ):
+            if _is_emergency_threat(
+                primary,
+                risk_threshold=0.92,
+                tca_threshold_s=150.0,
+                miss_distance_threshold_km=max(0.8, 0.5 * self.threshold_km),
+            ):
+                return EMERGENCY_ACTION_INDEX
             return self.dv_action
         return 0
 
@@ -386,97 +264,66 @@ class FuelAwareThresholdRulePolicy(BasePolicy):
 
 
 class MARLPolicy(BasePolicy):
-    """
-    MARL policy wrapper (uses trained MARL model).
-    """
-    
+    """MARL policy wrapper (uses trained MARL model)."""
+
     def __init__(self, marl_trainer, deterministic: bool = True):
-        """
-        Initialize MARL policy.
-        
-        Args:
-            marl_trainer: Trained MARL trainer instance
-        """
         self.marl_trainer = marl_trainer
         self.deterministic = bool(deterministic)
-    
-    def select_action(self, state: np.ndarray, agent_id: str) -> int:
-        """
-        Select action using MARL policy.
-        
-        Args:
-            state: Observation
-            agent_id: Agent identifier
-            
-        Returns:
-            Action index
-        """
+
+    def select_action(self, state: np.ndarray, agent_id: str) -> Union[int, Tuple[int, float]]:
         observations = {agent_id: state}
         actions = self.select_actions(observations)
         return actions.get(agent_id, 0)
 
-    def select_actions(self, observations: Dict[str, np.ndarray]) -> Dict[str, int]:
-        """Select joint actions using the MARL trainer in one call."""
+    def select_actions(self, observations: Dict[str, np.ndarray]) -> Dict[str, Union[int, Tuple[int, float]]]:
         return self.marl_trainer.get_actions(
             observations,
             deterministic=self.deterministic,
         )
-    
+
     def reset(self):
-        """Reset policy."""
         pass
 
 
 class RandomPolicy(BasePolicy):
     """Random policy for baseline comparison."""
-    
+
     def select_action(self, state: np.ndarray, agent_id: str) -> int:
-        """Select random action."""
-        return np.random.randint(0, 6)
-    
+        return int(np.random.randint(0, ACTION_COUNT))
+
     def reset(self):
-        """Reset policy."""
         pass
 
 
 class PolicyManager:
-    """
-    Manages multiple policies and enables easy switching.
-    """
-    
+    """Manages multiple policies and enables easy switching."""
+
     def __init__(self):
-        """Initialize policy manager."""
         self.policies: Dict[str, BasePolicy] = {}
-        self.active_policy = None
-    
+        self.active_policy: Optional[str] = None
+
     def register_policy(self, name: str, policy: BasePolicy) -> None:
-        """Register a policy."""
         self.policies[name] = policy
-    
+
     def use_policy(self, name: str) -> None:
-        """Switch to a policy."""
         if name not in self.policies:
             raise ValueError(f"Policy '{name}' not registered")
         self.active_policy = name
-    
-    def select_action(self, state: np.ndarray, agent_id: str) -> int:
-        """Select action using active policy."""
+
+    def select_action(self, state: np.ndarray, agent_id: str) -> Union[int, Tuple[int, float]]:
         if self.active_policy is None:
             raise ValueError("No active policy selected")
-        
         return self.policies[self.active_policy].select_action(state, agent_id)
 
-    def select_actions(self, observations: Dict[str, np.ndarray]) -> Dict[str, int]:
-        """Select actions for all visible agents using the active policy."""
+    def select_actions(self, observations: Dict[str, np.ndarray]) -> Dict[str, Union[int, Tuple[int, float]]]:
         if self.active_policy is None:
             raise ValueError("No active policy selected")
-
         return self.policies[self.active_policy].select_actions(observations)
-    
+
     def get_available_policies(self) -> list:
-        """Get list of registered policies."""
         return list(self.policies.keys())
-    
+
     def get_active_policy_name(self) -> str:
-        """Get name of active policy."""
+        if self.active_policy is None:
+            raise ValueError("No active policy selected")
         return self.active_policy

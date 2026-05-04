@@ -13,11 +13,14 @@ import plotly.express as px
 
 SUMMARY_METRICS: Dict[str, str] = {
     "mean_collisions": "Mean Collisions",
+    "collision_rate": "Collision Rate",
     "mean_fuel": "Mean Fuel Used (kg)",
     "mean_maneuvers": "Mean Maneuvers Executed",
     "mean_secondary_conjunctions": "Mean Secondary Conjunctions",
     "mean_near_misses": "Mean Near Misses",
     "mean_min_separation_km": "Mean Minimum Separation (km)",
+    "mean_efficiency_score": "Mean Efficiency Score",
+    "tc8_success_rate": "TC8 Success Rate",
 }
 
 RUN_METRICS: Dict[str, str] = {
@@ -26,6 +29,7 @@ RUN_METRICS: Dict[str, str] = {
     "total_maneuvers_executed": "Episode Maneuvers Executed",
     "total_secondary_conjunctions": "Episode Secondary Conjunctions",
     "total_near_misses": "Episode Near Misses",
+    "efficiency_score": "Episode Efficiency Score",
 }
 
 

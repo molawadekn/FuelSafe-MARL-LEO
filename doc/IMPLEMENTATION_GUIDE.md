@@ -2,25 +2,25 @@
 
 ## What Is Implemented
 
-The current codebase supports an end-to-end comparative workflow:
+The current codebase supports this end-to-end workflow:
 
 1. Build orbital scenarios with SGP4 reference states.
-2. Inject burns through a discrete maneuver engine with fuel accounting.
-3. Preserve burn effects across timesteps using persistent state offsets.
-4. Roll out heuristic and MARL policies in the same environment.
-5. Apply an optional CBF safety filter before execution.
-6. Aggregate collisions, fuel, maneuver counts, and secondary-conjunction metrics.
+2. Encode risk-aware observations with relative geometry, miss distance, TCA, and risk score.
+3. Select heuristic or MARL actions jointly across satellites.
+4. Apply an optional CBF safety filter before execution.
+5. Execute pre-propagation maneuvers with real fuel accounting.
+6. Roll out dense reward shaping and aggregate evaluation metrics.
 
 ## MARL Pipeline
 
 ### Training
 
-`marl/marl_trainer.py` now implements a consistent MAPPO-style flow:
-- actors operate on local observations
+`marl/marl_trainer.py` implements a MAPPO-style flow:
+- actors operate on local 70-d predictive Pc-aware observations
 - the critic operates on concatenated observations from all controlled satellites
-- the trainer stores the log-probability of the action that was actually taken
+- the trainer stores the log-probability of the action actually executed
 - advantages are computed with GAE-style bootstrapping
-- the critic trains on centralized observations instead of per-agent local vectors
+- checkpoint loading now tolerates partial shape mismatches so older checkpoints can still warm-start the new architecture
 
 ### Inference
 
@@ -39,79 +39,63 @@ The environment keeps:
 - a persistent position offset
 - a persistent velocity offset
 
-When a maneuver is executed, the offsets are updated and carried forward to future steps. This fixes the earlier behavior where burns only affected the current step.
+When a maneuver is executed, the velocity offset is applied immediately and the position offset is carried into subsequent propagation steps.
 
-## Fuel Handling
+## Fuel And Reward Handling
 
 Fuel appears in three places:
 - state observation as `fuel / max_fuel`
 - maneuver feasibility checks in `sim/maneuver_engine.py`
-- reward penalty using actual fuel burned in the step
+- dense reward shaping using actual fuel burned, risk level, proximity pressure, urgency, and risk reduction
 
 This makes the environment fuel-aware and fuel-constrained in both dynamics and reward shaping.
 
-## Dataset Integration
+## Emergency Maneuver Option
+
+The discrete action space now includes:
+- standard maneuvers `0` through `5`
+- `6` as an emergency radial-out burn
+
+Heuristic policies and the CBF safety layer can both escalate to this action when TCA or miss distance becomes critical.
+
+## Dataset Integration And Curriculum
 
 `sim/csv_data_loader.py` extracts conjunction features from ESA CDM data.
 
-`sim/dataset_integration.py` now passes scenario metadata into `env/ma_env.py`, which uses:
-- target orbital elements for `SAT_000`
-- chaser orbital elements for `DEB_000`
-- relative position and velocity features to seed the encounter geometry
+`sim/dataset_integration.py` now:
+- maps target orbital elements to `SAT_000`
+- maps chaser orbital elements to `DEB_000`
+- injects relative position and velocity features into the encounter geometry
+- supports stage-based sampling for progressively harder scenarios
 
-This is still a simplified mapping, but it is no longer dataset-in-name-only.
-
-The repository-level train/validate entry point is:
+The repository-level train entry point is:
 
 ```powershell
-.venv\Scripts\python.exe sim/dataset_integration.py --train-csv data\train_data.csv --test-csv data\test_data.csv --output-dir outputs\marl_train_validation
+.venv\Scripts\python.exe train.py --max-episodes 8000 --max-steps 120 --update-every 5 --eval-interval 50 --eval-episodes 5 --tc8-ratio 0.25 --use-dataset true --dataset-path data\train_data.jsonl --dataset-eval-path data\test_data.jsonl --save-dir policies\saved_models
 ```
-
-That flow trains on the train split, saves the learned weights, and then validates MARL against deterministic baselines on the test split.
-
-For the dataset-backed train/validate path, scenario selection is risk-stratified across unique events and uses a tighter collision threshold than the coarse stress-test harness so the CSV-driven runs are not dominated by immediate sub-kilometer collision labels.
 
 ## Synthetic Comparison Case
 
-`TC8_hypothetical_collision_cluster` is a handcrafted stress case added to `experiments/run_collision_avoidance_tests.py`.
+`TC8_hypothetical_collision_cluster` is the handcrafted short-warning stress case in `experiments/run_collision_avoidance_tests.py`.
 
-It uses:
-- 3 satellites
-- 1 synthetic imminent conjunction debris object
-- low available fuel
-- a close dataset-style relative geometry seed
+It is designed to:
+- keep collision pressure high
+- expose whether early action and emergency maneuvers are working
+- compare baseline, rule-based, and MARL policies under the same close conjunction
 
-The goal is not realism. It is a controlled comparison case where:
-- `no_op` collides
-- heuristic policies avoid the collision with moderate fuel use
-- the trained MARL policy also avoids the collision, but with much higher fuel usage
-
-## Local UI
-
-Run:
-
-```powershell
-.venv\Scripts\streamlit.exe run ui\streamlit_app.py
-```
-
-The UI can launch all major repo workflows and render interactive comparison charts directly from the generated CSV outputs.
+Use this case as a regression benchmark after each major training change.
+Always regenerate metrics locally from the latest checkpoint instead of relying on stale historical results.
 
 ## Reproducible Evaluation
 
 Use the test framework for controlled policy comparison:
 
 ```powershell
-.venv\Scripts\python.exe experiments/run_collision_avoidance_tests.py --quick --mc-runs 3 --max-debris 200
-```
-
-Use this for the key MARL and fuel-constrained comparison:
-
-```powershell
-.venv\Scripts\python.exe experiments/run_collision_avoidance_tests.py --test-cases TC4_marl,TC6_fuel_constrained --mc-runs 3 --max-debris 200 --include-marl --marl-untrained
+.venv\Scripts\python.exe experiments/run_collision_avoidance_tests.py --mc-runs 1 --max-debris 200 --include-marl --marl-model-path policies\saved_models\mppo_final.pt --output-dir outputs\test_framework_full_validation
 ```
 
 ## Practical Caveats
 
 - The simulator is suitable for research comparison and thesis experimentation, not for operational flight software.
 - Maneuver persistence is modeled with offsets relative to an SGP4 reference orbit, not full post-burn orbit determination.
-- Untrained MARL policies are supported for plumbing checks, but meaningful evaluation should load trained weights.
+- Policy quality remains checkpoint-dependent; track collisions, fuel, and secondary conjunctions together when comparing against heuristics.

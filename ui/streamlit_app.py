@@ -22,7 +22,7 @@ from sim.reporting import (
 )
 
 PYTHON_EXE = ROOT / ".venv" / "Scripts" / "python.exe"
-TRAINED_MODEL = ROOT / "outputs" / "marl_train_validation" / "marl_trained_from_train_dataset.pth"
+TRAINED_MODEL = ROOT / "policies" / "saved_models" / "mppo_final.pt"
 
 
 def run_command(args: List[str]) -> subprocess.CompletedProcess[str]:
@@ -71,42 +71,42 @@ def show_command_result(result: subprocess.CompletedProcess[str]) -> None:
 
 def render_summary_charts(summary_df: pd.DataFrame) -> None:
     st.subheader("Summary Table")
-    st.dataframe(summary_df, use_container_width=True)
+    st.dataframe(summary_df, width="stretch")
 
     for metric, label in SUMMARY_METRICS.items():
         if metric not in summary_df.columns:
             continue
         fig = build_summary_bar_figure(summary_df, metric)
         if fig is not None:
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
 
     pareto = build_pareto_figure(summary_df)
     if pareto is not None:
-        st.plotly_chart(pareto, use_container_width=True)
+        st.plotly_chart(pareto, width="stretch")
 
 
 def render_runs_charts(runs_df: pd.DataFrame) -> None:
     st.subheader("Raw Episode Runs")
-    st.dataframe(runs_df, use_container_width=True)
+    st.dataframe(runs_df, width="stretch")
 
     for metric, label in RUN_METRICS.items():
         if metric not in runs_df.columns:
             continue
         fig = build_run_distribution_figure(runs_df, metric)
         if fig is not None:
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
 
 
 def render_training_charts(train_df: pd.DataFrame) -> None:
     st.subheader("Training Metrics")
-    st.dataframe(train_df, use_container_width=True)
+    st.dataframe(train_df, width="stretch")
 
     for metric in ["final_collisions", "final_fuel_used", "final_steps", "actor_loss", "critic_loss"]:
         if metric not in train_df.columns:
             continue
         fig = build_training_progress_figure(train_df, metric)
         if fig is not None:
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
 
 
 st.set_page_config(page_title="FuelSafe Simulator UI", layout="wide")
@@ -130,11 +130,14 @@ if page == "Run Scenarios":
     with tabs[0]:
         st.subheader("Run Demo Comparison")
         with st.form("demo_form"):
-            episodes = st.number_input("Episodes", min_value=1, value=3)
-            steps = st.number_input("Steps", min_value=1, value=500)
-            sats = st.number_input("Satellites", min_value=1, value=3)
-            debris = st.number_input("Debris", min_value=1, value=5)
-            include_marl = st.checkbox("Include trained MARL", value=TRAINED_MODEL.exists())
+            col1, col2 = st.columns(2)
+            with col1:
+                episodes = st.number_input("Episodes", min_value=1, value=3)
+                steps = st.number_input("Steps", min_value=1, value=500)
+            with col2:
+                sats = st.number_input("Satellites", min_value=1, value=3)
+                debris = st.number_input("Debris", min_value=1, value=5)
+            include_marl = st.checkbox("Include trained MARL (mppo_final.pt)", value=TRAINED_MODEL.exists())
             submit = st.form_submit_button("Run Demo")
 
         if submit:
@@ -159,11 +162,14 @@ if page == "Run Scenarios":
         st.subheader("Run Dataset Experiment")
         with st.form("experiment_form"):
             dataset_path = st.text_input("Dataset CSV", str(ROOT / "data" / "test_data.csv"))
-            steps = st.number_input("Steps per scenario", min_value=1, value=120, key="exp_steps")
-            sats = st.number_input("Satellites", min_value=1, value=3, key="exp_sats")
-            debris = st.number_input("Debris", min_value=1, value=10, key="exp_debris")
-            max_scenarios = st.number_input("Max scenarios", min_value=1, value=8)
-            include_marl = st.checkbox("Include trained MARL", value=TRAINED_MODEL.exists(), key="exp_marl")
+            col1, col2 = st.columns(2)
+            with col1:
+                steps = st.number_input("Steps per scenario", min_value=1, value=120, key="exp_steps")
+                max_scenarios = st.number_input("Max scenarios", min_value=1, value=8)
+            with col2:
+                sats = st.number_input("Satellites", min_value=1, value=3, key="exp_sats")
+                debris = st.number_input("Debris", min_value=1, value=10, key="exp_debris")
+            include_marl = st.checkbox("Include trained MARL (mppo_final.pt)", value=TRAINED_MODEL.exists(), key="exp_marl")
             submit = st.form_submit_button("Run Experiment")
 
         if submit:
@@ -191,18 +197,25 @@ if page == "Run Scenarios":
     with tabs[2]:
         st.subheader("Train And Validate MARL")
         with st.form("train_validate_form"):
-            train_csv = st.text_input("Train CSV", str(ROOT / "data" / "train_data.csv"))
-            test_csv = st.text_input("Test CSV", str(ROOT / "data" / "test_data.csv"))
+            colx, coly = st.columns(2)
+            with colx:
+                train_csv = st.text_input("Train CSV", str(ROOT / "data" / "train_data.csv"))
+            with coly:
+                test_csv = st.text_input("Test CSV", str(ROOT / "data" / "test_data.csv"))
             output_dir = st.text_input("Output directory", str(ROOT / "outputs" / "ui" / "marl_train_validation"))
-            train_rows = st.number_input("Train max rows", min_value=1, value=5000)
-            test_rows = st.number_input("Test max rows", min_value=1, value=2000)
-            train_scenarios = st.number_input("Train scenarios", min_value=1, value=12)
-            test_scenarios = st.number_input("Test scenarios", min_value=1, value=8)
-            episodes_per_scenario = st.number_input("Episodes per scenario", min_value=1, value=4)
-            max_steps = st.number_input("Max steps", min_value=1, value=120)
-            sats = st.number_input("Satellites", min_value=1, value=3, key="tv_sats")
-            debris = st.number_input("Debris", min_value=1, value=10, key="tv_debris")
-            epochs_per_batch = st.number_input("MARL epochs per batch", min_value=1, value=3)
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                train_rows = st.number_input("Train max rows", min_value=1, value=5000)
+                train_scenarios = st.number_input("Train scenarios", min_value=1, value=12)
+                episodes_per_scenario = st.number_input("Episodes per scenario", min_value=1, value=4)
+                sats = st.number_input("Satellites", min_value=1, value=3, key="tv_sats")
+                epochs_per_batch = st.number_input("MARL epochs per batch", min_value=1, value=3)
+            with col2:
+                test_rows = st.number_input("Test max rows", min_value=1, value=2000)
+                test_scenarios = st.number_input("Test scenarios", min_value=1, value=8)
+                max_steps = st.number_input("Max steps", min_value=1, value=120)       
+                debris = st.number_input("Debris", min_value=1, value=10, key="tv_debris")
             submit = st.form_submit_button("Train + Validate")
 
         if submit:

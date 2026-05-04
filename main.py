@@ -90,13 +90,16 @@ def run_demo(
     print("FINAL POLICY COMPARISON")
     print("=" * 70)
 
+    print(f"{'Policy':<12} | {'Collisions':<16} | {'Fuel (kg)':<14} | {'Success':<10} | {'Secondary':<10} | {'Near Miss'}")
+    print("-" * 95)
     for policy_name, stats in results.items():
-        print(
-            f"{policy_name:12} | collisions {stats['mean_collisions']:.3f} "
-            f"+/- {stats['std_collisions']:.3f} | fuel {stats['mean_fuel']:.3f} "
-            f"+/- {stats['std_fuel']:.3f} | success0 {stats['success_rate'] * 100:.1f}% "
-            f"| success<=1 {stats.get('success_rate_<=1_collision', 0) * 100:.1f}%"
-        )
+        collisions_str = f"{stats['mean_collisions']:.2f}"
+        fuel_str = f"{stats['mean_fuel']:.2f}"
+        succ_str = f"{stats['success_rate'] * 100:.1f}%"
+        secondary_str = f"{stats.get('mean_secondary_conjunctions', 0):.1f}"
+        near_miss_str = f"{stats.get('mean_near_misses', 0):.1f}"
+        
+        print(f"{policy_name:<12} | {collisions_str:<16} | {fuel_str:<14} | {succ_str:<10} | {secondary_str:<10} | {near_miss_str}")
 
 
 def parse_args():
@@ -119,10 +122,11 @@ def parse_args():
         action="store_true",
         help="Include MARL policy (untrained unless model is provided).",
     )
+    default_marl = str(Path(__file__).resolve().parent / "policies" / "saved_models" / "mppo_final.pt")
     parser.add_argument(
         "--marl-model-path",
         type=str,
-        default=None,
+        default=default_marl,
         help="Optional path to load MARL policy weights.",
     )
 
