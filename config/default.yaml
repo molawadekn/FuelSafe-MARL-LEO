@@ -70,3 +70,26 @@ tracking:
   wandb_entity: ""            # your W&B username / team (leave blank for default)
   use_mlflow: false           # set true to enable MLflow logging
   mlflow_experiment: FuelSafe-MARL-LEO
+
+# ── Phase 2 — Advanced MARL Components ─────────────────────────────────────
+phase2:
+  # TarMAC inter-satellite communication
+  use_comm: false             # set true to enable TarMAC communication round
+  message_size: 16            # size of broadcast message vector (bandwidth proxy)
+  sig_size: 16                # signature / query vector size for targeted attention
+  comm_delay: false           # model 1-step propagation delay (realistic ISL latency)
+
+  # Graph Attention Network centralized critic
+  use_graph_critic: false     # set true to replace flat MLP critic with GAT critic
+
+  # Parameter-shared actor  (actor.type: shared)
+  # Uses a single SharedAttentionActor + agent-ID embedding for all satellites.
+  # Set actor.type: shared  to activate.
+  shared_embed_size: 8        # agent-ID embedding dimensionality
+  shared_max_agents: 16       # embedding table size
+
+  # Hierarchical fleet controller  (actor.type: hierarchical)
+  # FleetCommander fires every K steps; GoalConditionedActor executes.
+  # Set actor.type: hierarchical  to activate.
+  goal_size: 16               # commander goal vector dimensionality
+  commander_k: 5              # commander update interval (satellite steps)

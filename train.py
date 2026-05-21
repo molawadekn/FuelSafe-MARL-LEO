@@ -321,7 +321,7 @@ def train() -> None:
     )
 
     parser = argparse.ArgumentParser(
-        description="Train MARL Policy  (Phase 1: attention actor, Tsiolkovsky fuel, Foster Pc)"
+        description="Train MARL Policy  (Phase 2: TarMAC comm, GAT critic, shared/hierarchical actors)"
     )
     # Training
     parser.add_argument("--max-steps",    type=int,   default=_cfg(yaml_cfg,"training","max_steps",    default=120))
@@ -339,11 +339,20 @@ def train() -> None:
     parser.add_argument("--lr",           type=float, default=_cfg(yaml_cfg,"ppo","learning_rate",     default=3e-4))
     # Phase 1: actor architecture
     parser.add_argument("--actor-type",       type=str, default=_cfg(yaml_cfg,"actor","type",              default="attention"),
-                        help="mlp | attention | recurrent | ensemble")
+                        help="mlp | attention | recurrent | ensemble | shared | hierarchical")
     parser.add_argument("--hidden-size",      type=int, default=_cfg(yaml_cfg,"actor","hidden_size",        default=128))
     parser.add_argument("--num-heads",        type=int, default=_cfg(yaml_cfg,"actor","num_heads",          default=4))
     parser.add_argument("--num-tf-layers",    type=int, default=_cfg(yaml_cfg,"actor","num_transformer_layers", default=2))
     parser.add_argument("--ensemble-size",    type=int, default=_cfg(yaml_cfg,"actor","ensemble_size",      default=5))
+    # Phase 2: communication + critic
+    parser.add_argument("--use-comm",         type=str, default=str(_cfg(yaml_cfg,"phase2","use_comm",         default=False)),
+                        help="Enable TarMAC inter-satellite communication")
+    parser.add_argument("--use-graph-critic", type=str, default=str(_cfg(yaml_cfg,"phase2","use_graph_critic", default=False)),
+                        help="Use Graph Attention Network centralized critic")
+    parser.add_argument("--message-size",     type=int, default=_cfg(yaml_cfg,"phase2","message_size",         default=16))
+    parser.add_argument("--sig-size",         type=int, default=_cfg(yaml_cfg,"phase2","sig_size",             default=16))
+    parser.add_argument("--goal-size",        type=int, default=_cfg(yaml_cfg,"phase2","goal_size",            default=16))
+    parser.add_argument("--commander-k",      type=int, default=_cfg(yaml_cfg,"phase2","commander_k",          default=5))
     # Environment
     parser.add_argument("--tc8-ratio",    type=float, default=_cfg(yaml_cfg,"environment","tc8_ratio",  default=0.40))
     parser.add_argument("--realism",      type=str,   default=str(_cfg(yaml_cfg,"environment","realism",default=True)))
@@ -363,6 +372,8 @@ def train() -> None:
     use_realism            = _as_bool(args.realism)
     use_wandb              = _as_bool(args.use_wandb)
     use_mlflow             = _as_bool(args.use_mlflow)
+    use_comm               = _as_bool(args.use_comm)
+    use_graph_critic       = _as_bool(args.use_graph_critic)
     realism_config         = RealismConfig(enabled=use_realism)
     os.makedirs(args.save_dir, exist_ok=True)
 
@@ -370,7 +381,7 @@ def train() -> None:
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
 
-    # ── 3. Build trainer with Phase 1 actor ──────────────────────────────────
+    # ── 3. Build trainer with Phase 1 + Phase 2 components ───────────────────
     num_satellites = _cfg(yaml_cfg, "environment", "num_satellites", default=3)
     trainer = MARLTrainer(
         num_agents=num_satellites,
@@ -382,21 +393,33 @@ def train() -> None:
         ensemble_size=args.ensemble_size,
         num_heads=args.num_heads,
         num_transformer_layers=args.num_tf_layers,
+        # Phase 2
+        use_comm=use_comm,
+        use_graph_critic=use_graph_critic,
+        message_size=args.message_size,
+        sig_size=args.sig_size,
+        goal_size=args.goal_size,
+        commander_k=args.commander_k,
     )
     curriculum = CurriculumManager()
 
     # ── 4. Experiment tracker ────────────────────────────────────────────────
     tracker_config = {
-        "actor_type": args.actor_type,
-        "max_episodes": args.max_episodes,
-        "max_steps": args.max_steps,
-        "ppo_epochs": args.ppo_epochs,
-        "batch_size": args.batch_size,
-        "tc8_ratio": args.tc8_ratio,
-        "realism": use_realism,
-        "ensemble_size": args.ensemble_size,
-        "num_heads": args.num_heads,
-        "num_tf_layers": args.num_tf_layers,
+        "actor_type":       args.actor_type,
+        "max_episodes":     args.max_episodes,
+        "max_steps":        args.max_steps,
+        "ppo_epochs":       args.ppo_epochs,
+        "batch_size":       args.batch_size,
+        "tc8_ratio":        args.tc8_ratio,
+        "realism":          use_realism,
+        "ensemble_size":    args.ensemble_size,
+        "num_heads":        args.num_heads,
+        "num_tf_layers":    args.num_tf_layers,
+        "use_comm":         use_comm,
+        "use_graph_critic": use_graph_critic,
+        "message_size":     args.message_size,
+        "goal_size":        args.goal_size,
+        "commander_k":      args.commander_k,
     }
     tracker = ExperimentTracker(
         use_wandb=use_wandb,
@@ -416,14 +439,22 @@ def train() -> None:
             eval_scenarios = list(train_scenarios)
 
     print("\n" + "=" * 70)
-    print("STARTING MARL TRAINING  [Phase 1]")
+    print("STARTING MARL TRAINING  [Phase 2]")
     print(
         f"Actor:  {args.actor_type.upper()} | "
-        f"Episodes: {args.max_episodes} | "
+        f"Comm: {use_comm} | "
+        f"GraphCritic: {use_graph_critic} | "
+        f"Episodes: {args.max_episodes}"
+    )
+    print(
         f"TC8: {args.tc8_ratio:.2f} | "
         f"Realism: {use_realism} | "
         f"W&B: {use_wandb} | MLflow: {use_mlflow}"
     )
+    if args.actor_type == "hierarchical":
+        print(f"Hierarchical: goal_size={args.goal_size}, commander_k={args.commander_k}")
+    if use_comm:
+        print(f"TarMAC: msg={args.message_size}, sig={args.sig_size}")
     if use_dataset:
         print(f"Train scenarios: {len(train_scenarios)} | Eval scenarios: {len(eval_scenarios)}")
     print("=" * 70)
@@ -459,7 +490,8 @@ def train() -> None:
             realism_config=realism_config,
         )
 
-        # Reset recurrent hidden states at episode start
+        # Reset episode-level state (hidden states, comm buffers, goals, step counter)
+        trainer.reset_episode()
         if args.actor_type == "recurrent":
             trainer.reset_hidden_states()
 
