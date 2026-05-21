@@ -8,12 +8,12 @@ __pycache__/
 # Jupyter Notebooks
 .ipynb_checkpoints/
 
-# Environments
+# Environments (virtual env folders — NOT the env/ source package)
 .env/
 .venv/
 venv/
-env/
 ENV/
+# NOTE: env/ is the project's Python source package — tracked in git
 
 # Data and outputs
 data/*.csv

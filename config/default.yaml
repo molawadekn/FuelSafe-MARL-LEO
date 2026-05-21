@@ -1,0 +1,95 @@
+# FuelSafe-MARL-LEO  —  Phase 1 Default Configuration
+# =====================================================
+# All values here are overridable by CLI flags in train.py.
+# Format: YAML 1.1  (loaded via PyYAML)
+
+# ── Training loop ──────────────────────────────────────────────────────────
+training:
+  max_steps: 120              # steps per episode
+  max_episodes: 8000          # total training episodes
+  update_every: 5             # PPO update every N episodes
+  eval_interval: 50           # evaluation every N episodes
+  eval_episodes: 5            # episodes per evaluation cycle
+  terminate_on_collision: true
+  seed: 123
+
+# ── PPO hyperparameters ────────────────────────────────────────────────────
+ppo:
+  ppo_epochs: 10              # gradient update epochs per rollout
+  batch_size: 128             # mini-batch size
+  learning_rate: 3.0e-4
+  gamma: 0.99                 # discount factor
+  gae_lambda: 0.95            # GAE λ
+  clip_ratio: 0.2             # PPO clip ε
+  value_loss_coeff: 0.5
+  max_grad_norm: 0.5
+
+# ── Entropy annealing ──────────────────────────────────────────────────────
+entropy:
+  start: 0.02
+  end: 0.005
+
+# ── Actor architecture  (Phase 1) ──────────────────────────────────────────
+actor:
+  type: attention             # mlp | attention | recurrent | ensemble
+  hidden_size: 128
+  num_heads: 4                # transformer attention heads
+  num_transformer_layers: 2   # transformer encoder depth
+  dropout: 0.1
+  ensemble_size: 5            # members when type == ensemble
+
+# ── Environment ────────────────────────────────────────────────────────────
+environment:
+  num_satellites: 3
+  tc8_ratio: 0.40             # fraction of hard (TC8-like) episodes
+  realism: true               # enable noise / partial observability
+  distance_threshold_km: 10.0
+  secondary_conjunction_risk_threshold: 0.01
+
+# ── Physics  (Phase 1) ─────────────────────────────────────────────────────
+physics:
+  use_tsiolkovsky: true       # Tsiolkovsky rocket equation for fuel
+  isp_seconds: 220.0          # specific impulse (hydrazine monopropellant)
+  sat_dry_mass_kg: 200.0      # satellite dry mass (structural + payload)
+  initial_fuel_kg: 100.0      # propellant load at episode start
+
+# ── Dataset ────────────────────────────────────────────────────────────────
+dataset:
+  use_dataset: false
+  train_path: data/train_data.jsonl
+  eval_path: data/test_data.jsonl
+
+# ── Output ─────────────────────────────────────────────────────────────────
+output:
+  save_dir: policies/saved_models
+
+# ── Experiment tracking  (Phase 1) ─────────────────────────────────────────
+tracking:
+  use_wandb: false            # set true to enable Weights & Biases logging
+  wandb_project: fuelsafe-marl-leo
+  wandb_entity: ""            # your W&B username / team (leave blank for default)
+  use_mlflow: false           # set true to enable MLflow logging
+  mlflow_experiment: FuelSafe-MARL-LEO
+
+# ── Phase 2 — Advanced MARL Components ─────────────────────────────────────
+phase2:
+  # TarMAC inter-satellite communication
+  use_comm: false             # set true to enable TarMAC communication round
+  message_size: 16            # size of broadcast message vector (bandwidth proxy)
+  sig_size: 16                # signature / query vector size for targeted attention
+  comm_delay: false           # model 1-step propagation delay (realistic ISL latency)
+
+  # Graph Attention Network centralized critic
+  use_graph_critic: false     # set true to replace flat MLP critic with GAT critic
+
+  # Parameter-shared actor  (actor.type: shared)
+  # Uses a single SharedAttentionActor + agent-ID embedding for all satellites.
+  # Set actor.type: shared  to activate.
+  shared_embed_size: 8        # agent-ID embedding dimensionality
+  shared_max_agents: 16       # embedding table size
+
+  # Hierarchical fleet controller  (actor.type: hierarchical)
+  # FleetCommander fires every K steps; GoalConditionedActor executes.
+  # Set actor.type: hierarchical  to activate.
+  goal_size: 16               # commander goal vector dimensionality
+  commander_k: 5              # commander update interval (satellite steps)

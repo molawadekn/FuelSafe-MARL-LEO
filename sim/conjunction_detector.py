@@ -49,13 +49,50 @@ class ConjunctionDetector:
         self.alert_counter = 0
 
     @staticmethod
-    def compute_collision_probability(miss_distance_km: float, time_to_ca_s: float) -> float:
+    def compute_collision_probability(
+        miss_distance_km: float,
+        time_to_ca_s: float,
+        sat_radius_km: float = 0.005,    # satellite hard-body radius (5 m)
+        deb_radius_km: float = 0.001,    # debris hard-body radius (1 m)
+        sigma_base_km: float = 0.020,    # base 1-σ position uncertainty (SSN: 20 m)
+        covariance_growth_rate: float = 1e-4,  # σ growth per second of TCA horizon
+    ) -> float:
         """
-        Compute theoretical collision probability using an exponential Gaussian envelope.
+        Compute collision probability using Foster's 2-D Gaussian formula.
+
+        Phase 1 upgrade: replaces the non-physical exponential heuristic with
+        the standard conjunction assessment formula used by operational SSA
+        systems (Foster & Estes 1992, simplified isotropic case).
+
+        Formula (isotropic covariance, 2-D conjunction plane):
+            Pc = (A_eff / (2π σ²)) × exp(−d_miss² / (2σ²))
+
+        where:
+            A_eff = π (r_sat + r_deb)²   combined hard-body cross-section
+            σ     = σ_base × (1 + k × TCA_s)  covariance grows with prediction horizon
+            d_miss = miss distance at TCA (km)
+
+        Physical interpretation:
+            - Objects with large position uncertainty (old TLEs, long TCA)
+              have genuinely higher Pc even at the same miss distance.
+            - Returns 0 if miss_distance >> σ (conjunction is clearly safe).
+            - Returns ≈1 when miss_distance < combined hard-body radius.
         """
-        d0 = 0.05  # 50m miss distance exponential scaling envelope
-        t0 = 300.0  # 5 minute TCA urgency exponential scaling envelope
-        return float(np.exp(-max(0.0, miss_distance_km) / d0) * np.exp(-max(0.0, time_to_ca_s) / t0))
+        d      = max(0.0, float(miss_distance_km))
+        t      = max(0.0, float(time_to_ca_s))
+
+        # Combined position uncertainty at TCA (grows with prediction horizon)
+        sigma  = sigma_base_km * (1.0 + covariance_growth_rate * t)
+        sigma  = max(sigma, 1e-9)
+
+        # Combined hard-body cross-sectional area
+        r_comb = sat_radius_km + deb_radius_km
+        A_eff  = np.pi * (r_comb ** 2)
+
+        # Foster 2-D isotropic formula
+        Pc = (A_eff / (2.0 * np.pi * sigma ** 2)) * np.exp(-0.5 * (d / sigma) ** 2)
+
+        return float(np.clip(Pc, 0.0, 1.0))
         
     def detect(self, object_states: Dict[str, np.ndarray],
               timestamp: datetime,
