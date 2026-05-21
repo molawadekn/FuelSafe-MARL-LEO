@@ -1,6 +1,17 @@
 """
 MODULE 6: Multi-Agent Reinforcement Learning Training Layer
 Implements a lightweight MAPPO-style trainer with centralized critic input.
+
+Phase 1 upgrades
+----------------
+* actor_type parameter selects: "mlp" (original) | "attention" (transformer) |
+  "recurrent" (attention + GRU) | "ensemble" (N attention networks).
+* ensemble_size controls how many members EnsembleActor uses.
+* Recurrent mode: hidden states per agent are managed by the trainer and
+  reset at episode boundaries via reset_hidden_states().
+* get_action_details now returns per-agent epistemic_uncertainty when using
+  an EnsembleActor.
+* Uncertainty is logged in training_stats for W&B / MLflow export.
 """
 
 from __future__ import annotations
@@ -153,6 +164,8 @@ class PPOBuffer:
 class MARLTrainer:
     """
     MAPPO trainer using centralized training with decentralized execution.
+
+    Phase 1 upgrade: supports attention / recurrent / ensemble actor types.
     """
 
     def __init__(
@@ -169,23 +182,40 @@ class MARLTrainer:
         max_grad_norm: float = 0.5,
         clip_ratio: float = 0.2,
         device: str = "cpu",
+        # Phase 1 additions
+        actor_type: str = "mlp",          # "mlp" | "attention" | "recurrent" | "ensemble"
+        ensemble_size: int = 5,           # used when actor_type == "ensemble"
+        num_heads: int = 4,               # attention head count
+        num_transformer_layers: int = 2,  # transformer depth
     ):
-        self.num_agents = num_agents
-        self.obs_size = obs_size
-        self.action_size = action_size
-        self.device = device
+        self.num_agents   = num_agents
+        self.obs_size     = obs_size
+        self.action_size  = action_size
+        self.device       = device
+        self.actor_type   = actor_type
 
-        self.gamma = gamma
-        self.gae_lambda = gae_lambda
-        self.entropy_coeff = entropy_coeff
-        self.value_loss_coeff = value_loss_coeff
-        self.max_grad_norm = max_grad_norm
-        self.clip_ratio = clip_ratio
+        self.gamma             = gamma
+        self.gae_lambda        = gae_lambda
+        self.entropy_coeff     = entropy_coeff
+        self.value_loss_coeff  = value_loss_coeff
+        self.max_grad_norm     = max_grad_norm
+        self.clip_ratio        = clip_ratio
 
-        self.actors = {
-            f"SAT_{i:03d}": ActorNetwork(obs_size, action_size, hidden_size).to(device)
+        # ── Build actors using the factory ───────────────────────────────────
+        from marl.attention_actor import build_actor
+        self.actors: Dict[str, nn.Module] = {
+            f"SAT_{i:03d}": build_actor(
+                actor_type=actor_type,
+                input_size=obs_size,
+                output_size=action_size,
+                hidden_size=hidden_size,
+                num_heads=num_heads,
+                num_transformer_layers=num_transformer_layers,
+                ensemble_size=ensemble_size,
+            ).to(device)
             for i in range(num_agents)
         }
+
         self.critic = CriticNetwork(obs_size * num_agents, hidden_size).to(device)
 
         self.actor_optimizers = {
@@ -197,9 +227,25 @@ class MARLTrainer:
         self.buffers = {agent_id: PPOBuffer() for agent_id in self.actors.keys()}
         self.training_stats: List[Dict[str, float]] = []
 
+        # ── Recurrent hidden states (used when actor_type == "recurrent") ────
+        self._hidden_states: Dict[str, Optional[torch.Tensor]] = {
+            aid: None for aid in self.actors.keys()
+        }
+
     def set_entropy(self, coeff: float) -> None:
         """Update entropy coefficient for scheduled annealing."""
         self.entropy_coeff = float(coeff)
+
+    def reset_hidden_states(self) -> None:
+        """
+        Reset GRU hidden states for all agents.
+        Call at the start of every episode when using actor_type='recurrent'.
+        """
+        for aid, actor in self.actors.items():
+            if hasattr(actor, "initial_hidden"):
+                self._hidden_states[aid] = actor.initial_hidden(self.device)
+            else:
+                self._hidden_states[aid] = None
 
     def _build_central_observation(self, observations: Dict[str, np.ndarray]) -> np.ndarray:
         """Concatenate observations in a stable agent order for the centralized critic."""
@@ -231,23 +277,55 @@ class MARLTrainer:
     ) -> Tuple[Dict[str, Any], Dict[str, float], float]:
         """
         Return joint actions, per-agent log-probs, and centralized value estimate.
+
+        Phase 1: also handles recurrent (GRU hidden states) and ensemble
+        (epistemic uncertainty) actors transparently.
         """
-        actions: Dict[str, Any] = {}
-        log_probs: Dict[str, float] = {}
+        actions:          Dict[str, Any]   = {}
+        log_probs:        Dict[str, float] = {}
+        uncertainties:    Dict[str, float] = {}
         central_obs = self._build_central_observation(observations)
-        value = self._critic_value(central_obs)
+        value       = self._critic_value(central_obs)
 
         for agent_id, actor in self.actors.items():
             obs = observations.get(agent_id)
             if obs is None:
-                actions[agent_id] = (0, 0.0)
-                log_probs[agent_id] = 0.0
+                actions[agent_id]       = (0, 0.0)
+                log_probs[agent_id]     = 0.0
+                uncertainties[agent_id] = 0.0
                 continue
 
-            action, log_prob = actor.get_action(obs, self.device, deterministic=deterministic)
-            actions[agent_id] = action
+            # ── Recurrent actor: thread hidden state ─────────────────────
+            if hasattr(actor, "get_action") and hasattr(actor, "initial_hidden"):
+                h = self._hidden_states.get(agent_id)
+                if h is None:
+                    h = actor.initial_hidden(self.device)
+                action, log_prob, h_new = actor.get_action(
+                    obs, self.device, deterministic=deterministic, hidden=h
+                )
+                self._hidden_states[agent_id] = h_new
+                uncertainties[agent_id] = 0.0
+
+            # ── Ensemble actor: capture epistemic uncertainty ─────────────
+            elif hasattr(actor, "get_uncertainty"):
+                action, log_prob = actor.get_action(
+                    obs, self.device, deterministic=deterministic
+                )
+                uncertainties[agent_id] = actor.get_uncertainty(obs, self.device)
+
+            # ── Standard actor (MLP or attention without recurrence) ──────
+            else:
+                action, log_prob = actor.get_action(
+                    obs, self.device, deterministic=deterministic
+                )
+                uncertainties[agent_id] = 0.0
+
+            actions[agent_id]   = action
             log_probs[agent_id] = log_prob
 
+        # Attach uncertainty to value slot via a side-channel attribute
+        # (keeps the return signature backward-compatible)
+        self._last_uncertainties = uncertainties
         return actions, log_probs, value
 
     def get_actions(

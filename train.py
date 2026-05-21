@@ -1,6 +1,14 @@
 #!/usr/bin/env python3
 """
 Training script for MARL collision avoidance with curriculum and dataset support.
+
+Phase 1 upgrades
+----------------
+* Loads hyperparameters from config/default.yaml (CLI flags override YAML).
+* Supports --actor-type: mlp | attention | recurrent | ensemble.
+* Optional W&B logging via --use-wandb flag.
+* Optional MLflow logging via --use-mlflow flag.
+* Tsiolkovsky fuel model and Foster Pc active by default (controlled via YAML).
 """
 
 from __future__ import annotations
@@ -26,6 +34,90 @@ from sim.evaluation import compute_efficiency_score, compute_tc8_success_rate, s
 from sim.maneuver_engine import ACTION_COUNT
 from sim.observation_utils import OBS_SIZE
 from sim.realism import RealismConfig
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# YAML config loader
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _load_yaml_config(path: str) -> Dict[str, Any]:
+    """Load YAML config; returns empty dict if file missing or PyYAML absent."""
+    try:
+        import yaml
+        with open(path, "r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+        return cfg
+    except FileNotFoundError:
+        return {}
+    except ImportError:
+        print("[WARNING] PyYAML not installed — skipping YAML config. "
+              "Run: pip install pyyaml")
+        return {}
+
+
+def _cfg(yaml_cfg: Dict, *keys, default=None):
+    """Safely navigate nested YAML dict: _cfg(cfg, 'ppo', 'learning_rate')."""
+    node = yaml_cfg
+    for k in keys:
+        if not isinstance(node, dict):
+            return default
+        node = node.get(k, default)
+        if node is default:
+            return default
+    return node
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Experiment tracker (W&B + MLflow, both optional)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ExperimentTracker:
+    """
+    Thin wrapper around W&B and/or MLflow.
+    Both are optional — the tracker degrades gracefully if not installed.
+    """
+
+    def __init__(self, use_wandb: bool, use_mlflow: bool,
+                 project: str, entity: str, experiment: str, config: Dict):
+        self._wandb   = None
+        self._mlflow  = None
+
+        if use_wandb:
+            try:
+                import wandb
+                wandb.init(
+                    project=project,
+                    entity=entity or None,
+                    config=config,
+                    reinit=True,
+                )
+                self._wandb = wandb
+                print(f"[W&B] Tracking enabled → project: {project}")
+            except ImportError:
+                print("[WARNING] wandb not installed. Run: pip install wandb")
+
+        if use_mlflow:
+            try:
+                import mlflow
+                mlflow.set_experiment(experiment)
+                mlflow.start_run()
+                mlflow.log_params(config)
+                self._mlflow = mlflow
+                print(f"[MLflow] Tracking enabled → experiment: {experiment}")
+            except ImportError:
+                print("[WARNING] mlflow not installed. Run: pip install mlflow")
+
+    def log(self, metrics: Dict[str, float], step: int) -> None:
+        if self._wandb:
+            self._wandb.log(metrics, step=step)
+        if self._mlflow:
+            self._mlflow.log_metrics(metrics, step=step)
+
+    def finish(self) -> None:
+        if self._wandb:
+            self._wandb.finish()
+        if self._mlflow:
+            self._mlflow.end_run()
 
 def _as_bool(value: str) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
@@ -223,59 +315,97 @@ def _evaluate_policy(
 
 
 def train() -> None:
-    parser = argparse.ArgumentParser(description="Train MARL Policy")
-    parser.add_argument("--max-steps", type=int, default=120, help="Steps per episode")
-    parser.add_argument("--max-episodes", type=int, default=8000, help="Total episodes to train")
-    parser.add_argument("--save-dir", type=str, default="policies/saved_models", help="Save directory")
-    parser.add_argument("--update-every", type=int, default=5, help="Update weights every N episodes")
-    parser.add_argument("--eval-interval", type=int, default=50, help="Evaluate every N episodes")
-    parser.add_argument("--eval-episodes", type=int, default=5, help="Episodes per evaluation cycle")
-    parser.add_argument("--entropy-start", type=float, default=0.02, help="Initial entropy coefficient")
-    parser.add_argument("--entropy-end", type=float, default=0.005, help="Final entropy coefficient")
-    parser.add_argument("--ppo-epochs", type=int, default=10, help="PPO epochs per policy update")
-    parser.add_argument("--batch-size", type=int, default=128, help="Mini-batch size for PPO updates")
-    parser.add_argument("--use-dataset", type=str, default="false", help="Use dataset JSONL")
-    parser.add_argument(
-        "--dataset-path",
-        type=str,
-        default="data/train_data.jsonl",
-        help="Training dataset JSONL path",
+    # ── 1. Load YAML config (base layer) ─────────────────────────────────────
+    yaml_cfg = _load_yaml_config(
+        str(Path(__file__).parent / "config" / "default.yaml")
     )
-    parser.add_argument(
-        "--dataset-eval-path",
-        type=str,
-        default="data/test_data.jsonl",
-        help="Evaluation dataset JSONL path",
+
+    parser = argparse.ArgumentParser(
+        description="Train MARL Policy  (Phase 1: attention actor, Tsiolkovsky fuel, Foster Pc)"
     )
-    parser.add_argument("--tc8-ratio", type=float, default=0.40, help="Ratio of hard TC8-like episodes")
-    parser.add_argument(
-        "--realism",
-        type=str,
-        default="true",
-        help="Enable realism uncertainty injection (true/false)",
-    )
-    parser.add_argument(
-        "--terminate-on-collision",
-        type=str,
-        default="true",
-        help="End rollout early on first satellite collision (true/false)",
-    )
-    parser.add_argument("--seed", type=int, default=123, help="Random seed")
+    # Training
+    parser.add_argument("--max-steps",    type=int,   default=_cfg(yaml_cfg,"training","max_steps",    default=120))
+    parser.add_argument("--max-episodes", type=int,   default=_cfg(yaml_cfg,"training","max_episodes", default=8000))
+    parser.add_argument("--save-dir",     type=str,   default=_cfg(yaml_cfg,"output","save_dir",       default="policies/saved_models"))
+    parser.add_argument("--update-every", type=int,   default=_cfg(yaml_cfg,"training","update_every", default=5))
+    parser.add_argument("--eval-interval",type=int,   default=_cfg(yaml_cfg,"training","eval_interval",default=50))
+    parser.add_argument("--eval-episodes",type=int,   default=_cfg(yaml_cfg,"training","eval_episodes",default=5))
+    parser.add_argument("--seed",         type=int,   default=_cfg(yaml_cfg,"training","seed",         default=123))
+    # PPO
+    parser.add_argument("--entropy-start",type=float, default=_cfg(yaml_cfg,"entropy","start",         default=0.02))
+    parser.add_argument("--entropy-end",  type=float, default=_cfg(yaml_cfg,"entropy","end",           default=0.005))
+    parser.add_argument("--ppo-epochs",   type=int,   default=_cfg(yaml_cfg,"ppo","ppo_epochs",        default=10))
+    parser.add_argument("--batch-size",   type=int,   default=_cfg(yaml_cfg,"ppo","batch_size",        default=128))
+    parser.add_argument("--lr",           type=float, default=_cfg(yaml_cfg,"ppo","learning_rate",     default=3e-4))
+    # Phase 1: actor architecture
+    parser.add_argument("--actor-type",       type=str, default=_cfg(yaml_cfg,"actor","type",              default="attention"),
+                        help="mlp | attention | recurrent | ensemble")
+    parser.add_argument("--hidden-size",      type=int, default=_cfg(yaml_cfg,"actor","hidden_size",        default=128))
+    parser.add_argument("--num-heads",        type=int, default=_cfg(yaml_cfg,"actor","num_heads",          default=4))
+    parser.add_argument("--num-tf-layers",    type=int, default=_cfg(yaml_cfg,"actor","num_transformer_layers", default=2))
+    parser.add_argument("--ensemble-size",    type=int, default=_cfg(yaml_cfg,"actor","ensemble_size",      default=5))
+    # Environment
+    parser.add_argument("--tc8-ratio",    type=float, default=_cfg(yaml_cfg,"environment","tc8_ratio",  default=0.40))
+    parser.add_argument("--realism",      type=str,   default=str(_cfg(yaml_cfg,"environment","realism",default=True)))
+    parser.add_argument("--terminate-on-collision", type=str, default=str(_cfg(yaml_cfg,"training","terminate_on_collision", default=True)))
+    # Dataset
+    parser.add_argument("--use-dataset",       type=str, default="false")
+    parser.add_argument("--dataset-path",      type=str, default=_cfg(yaml_cfg,"dataset","train_path", default="data/train_data.jsonl"))
+    parser.add_argument("--dataset-eval-path", type=str, default=_cfg(yaml_cfg,"dataset","eval_path",  default="data/test_data.jsonl"))
+    # Phase 1: experiment tracking
+    parser.add_argument("--use-wandb",  type=str, default=str(_cfg(yaml_cfg,"tracking","use_wandb",  default=False)))
+    parser.add_argument("--use-mlflow", type=str, default=str(_cfg(yaml_cfg,"tracking","use_mlflow", default=False)))
     args = parser.parse_args()
 
-    use_dataset = _as_bool(args.use_dataset)
+    # ── 2. Resolve settings ──────────────────────────────────────────────────
+    use_dataset            = _as_bool(args.use_dataset)
     terminate_on_collision = _as_bool(args.terminate_on_collision)
-    use_realism = _as_bool(args.realism)
-    realism_config = RealismConfig(enabled=use_realism)
+    use_realism            = _as_bool(args.realism)
+    use_wandb              = _as_bool(args.use_wandb)
+    use_mlflow             = _as_bool(args.use_mlflow)
+    realism_config         = RealismConfig(enabled=use_realism)
     os.makedirs(args.save_dir, exist_ok=True)
 
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
 
-    num_satellites = 3
-    trainer = MARLTrainer(num_agents=num_satellites, obs_size=OBS_SIZE, action_size=ACTION_COUNT)
+    # ── 3. Build trainer with Phase 1 actor ──────────────────────────────────
+    num_satellites = _cfg(yaml_cfg, "environment", "num_satellites", default=3)
+    trainer = MARLTrainer(
+        num_agents=num_satellites,
+        obs_size=OBS_SIZE,
+        action_size=ACTION_COUNT,
+        learning_rate=args.lr,
+        hidden_size=args.hidden_size,
+        actor_type=args.actor_type,
+        ensemble_size=args.ensemble_size,
+        num_heads=args.num_heads,
+        num_transformer_layers=args.num_tf_layers,
+    )
     curriculum = CurriculumManager()
+
+    # ── 4. Experiment tracker ────────────────────────────────────────────────
+    tracker_config = {
+        "actor_type": args.actor_type,
+        "max_episodes": args.max_episodes,
+        "max_steps": args.max_steps,
+        "ppo_epochs": args.ppo_epochs,
+        "batch_size": args.batch_size,
+        "tc8_ratio": args.tc8_ratio,
+        "realism": use_realism,
+        "ensemble_size": args.ensemble_size,
+        "num_heads": args.num_heads,
+        "num_tf_layers": args.num_tf_layers,
+    }
+    tracker = ExperimentTracker(
+        use_wandb=use_wandb,
+        use_mlflow=use_mlflow,
+        project=_cfg(yaml_cfg, "tracking", "wandb_project", default="fuelsafe-marl-leo"),
+        entity=_cfg(yaml_cfg, "tracking", "wandb_entity", default=""),
+        experiment=_cfg(yaml_cfg, "tracking", "mlflow_experiment", default="FuelSafe-MARL-LEO"),
+        config=tracker_config,
+    )
 
     train_scenarios: List[Dict[str, Any]] = []
     eval_scenarios: List[Dict[str, Any]] = []
@@ -286,13 +416,13 @@ def train() -> None:
             eval_scenarios = list(train_scenarios)
 
     print("\n" + "=" * 70)
-    print("STARTING MARL TRAINING")
+    print("STARTING MARL TRAINING  [Phase 1]")
     print(
-        f"Target: {args.max_episodes} episodes | "
-        f"Use Dataset: {use_dataset} | "
-        f"Terminate On Collision: {terminate_on_collision} | "
-        f"TC8 Mix: {args.tc8_ratio:.2f} | "
-        f"Realism: {use_realism}"
+        f"Actor:  {args.actor_type.upper()} | "
+        f"Episodes: {args.max_episodes} | "
+        f"TC8: {args.tc8_ratio:.2f} | "
+        f"Realism: {use_realism} | "
+        f"W&B: {use_wandb} | MLflow: {use_mlflow}"
     )
     if use_dataset:
         print(f"Train scenarios: {len(train_scenarios)} | Eval scenarios: {len(eval_scenarios)}")
@@ -329,6 +459,10 @@ def train() -> None:
             realism_config=realism_config,
         )
 
+        # Reset recurrent hidden states at episode start
+        if args.actor_type == "recurrent":
+            trainer.reset_hidden_states()
+
         episode_stats = _run_episode(
             trainer=trainer,
             env=env,
@@ -346,16 +480,35 @@ def train() -> None:
             episodes_since_update = 0
 
         if global_episode % 10 == 0:
+            # Epistemic uncertainty (ensemble mode)
+            mean_uncertainty = float(np.mean(list(
+                getattr(trainer, "_last_uncertainties", {}).values()
+            ))) if hasattr(trainer, "_last_uncertainties") else 0.0
+
             print(
                 f"Ep {global_episode:4d} | "
+                f"Actor: {args.actor_type[:3].upper()} | "
                 f"Coll: {episode_stats['collisions']:.1f} | "
                 f"Fuel: {episode_stats['fuel']:6.2f} | "
                 f"Man: {episode_stats['maneuvers']:5.1f} | "
-                f"Sec: {episode_stats['secondary']:.1f} | "
                 f"Score: {episode_stats['score']:7.2f} | "
-                f"ENT: {entropy_coeff:.4f} | "
+                f"Unc: {mean_uncertainty:.3f} | "
                 f"Loss: {latest_train_metrics.get('actor_loss', 0.0):.4f}"
             )
+            # Log to tracker
+            tracker.log({
+                "episode/collisions":  episode_stats["collisions"],
+                "episode/fuel":        episode_stats["fuel"],
+                "episode/maneuvers":   episode_stats["maneuvers"],
+                "episode/score":       episode_stats["score"],
+                "episode/near_misses": episode_stats["near_misses"],
+                "train/actor_loss":    latest_train_metrics.get("actor_loss", 0.0),
+                "train/critic_loss":   latest_train_metrics.get("critic_loss", 0.0),
+                "train/entropy":       latest_train_metrics.get("entropy", 0.0),
+                "train/entropy_coeff": entropy_coeff,
+                "train/uncertainty":   mean_uncertainty,
+                "curriculum/stage":    curriculum.current_stage_idx + 1,
+            }, step=global_episode)
 
         if global_episode % args.eval_interval == 0:
             eval_metrics = _evaluate_policy(
@@ -385,6 +538,16 @@ def train() -> None:
                 f"Curr={eval_metrics['curriculum_score']:.3f}, "
                 f"TC8={eval_metrics['tc8_success_rate']:.3f}"
             )
+            # Log eval metrics to tracker
+            tracker.log({
+                f"eval/mean_collisions":   eval_metrics["mean_collisions"],
+                f"eval/collision_rate":    eval_metrics["collision_rate"],
+                f"eval/mean_fuel":         eval_metrics["mean_fuel"],
+                f"eval/mean_maneuvers":    eval_metrics["mean_maneuvers"],
+                f"eval/mean_score":        eval_metrics["mean_score"],
+                f"eval/curriculum_score":  eval_metrics["curriculum_score"],
+                f"eval/tc8_success_rate":  eval_metrics.get("tc8_success_rate", 0.0) or 0.0,
+            }, step=global_episode)
 
             save_path = os.path.join(args.save_dir, f"mppo_checkpoint_{global_episode}.pt")
             trainer.save(save_path)
@@ -398,6 +561,7 @@ def train() -> None:
     trainer.save(final_path)
     save_pareto_artifacts(eval_history, args.save_dir, "final")
     print(f"Final model saved to {final_path}")
+    tracker.finish()
 
 
 if __name__ == "__main__":

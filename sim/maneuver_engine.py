@@ -18,6 +18,21 @@ MEDIUM_BURN_RANGE_MPS = (0.5, 1.5)
 EMERGENCY_BURN_RANGE_MPS = (2.0, 5.0)
 MAX_DELTA_V_PER_STEP_KMS = EMERGENCY_BURN_RANGE_MPS[1] * MPS_TO_KMS
 
+# ── Tsiolkovsky rocket equation constants ────────────────────────────────────
+# Phase 1 upgrade: replaces the ad-hoc linear fuel = 1000 × ΔV model.
+#
+# Tsiolkovsky: ΔV = Isp × g₀ × ln(m_wet / m_dry)
+#   → m_dry = m_wet × exp(-ΔV / (Isp × g₀))
+#   → fuel_consumed = m_wet - m_dry = m_wet × (1 − exp(-ΔV / (Isp × g₀)))
+#
+# Isp = 220 s  → typical hydrazine monopropellant thruster (e.g. MR-106)
+# g₀  = 9.81 m/s² = 0.00981 km/s²
+ISP_SECONDS       = 220.0          # specific impulse (s)
+G0_KMS2           = 0.00981        # standard gravity in km/s²
+ISP_G0_KMS        = ISP_SECONDS * G0_KMS2   # effective exhaust velocity (km/s) ≈ 2.158 km/s
+SAT_DRY_MASS_KG   = 200.0          # satellite dry mass (kg) — structural + payload
+SAT_WET_MASS_KG   = SAT_DRY_MASS_KG + 100.0  # initial wet mass (dry + 100 kg fuel)
+
 
 class ManeuverType(Enum):
     """Types of discrete maneuvers."""
@@ -57,15 +72,16 @@ class ManeuverEngine:
     def __init__(
         self,
         max_delta_v_per_step: float = MAX_DELTA_V_PER_STEP_KMS,
-        fuel_consumption_factor: float = 1000.0,
+        fuel_consumption_factor: float = 1000.0,   # legacy; ignored when use_tsiolkovsky=True
         discrete_delta_v: float = 1.0e-3,
         emergency_delta_v: float = 3.5e-3,
+        use_tsiolkovsky: bool = True,              # Phase 1: enable physics-accurate fuel model
+        sat_dry_mass_kg: float = SAT_DRY_MASS_KG,
     ):
-        # The simulator propagates velocity in km/s, but the control design is
-        # specified in m/s. Internally we keep magnitudes in km/s and convert
-        # fuel-equivalent accounting with a 1000x scale.
-        self.max_delta_v = float(max_delta_v_per_step)
-        self.fuel_factor = float(fuel_consumption_factor)
+        self.max_delta_v       = float(max_delta_v_per_step)
+        self.fuel_factor       = float(fuel_consumption_factor)  # legacy fallback
+        self.use_tsiolkovsky   = bool(use_tsiolkovsky)
+        self.sat_dry_mass_kg   = float(sat_dry_mass_kg)
         self.small_burn_range_kms = tuple(self._mps_to_kms(v) for v in SMALL_BURN_RANGE_MPS)
         self.medium_burn_range_kms = tuple(self._mps_to_kms(v) for v in MEDIUM_BURN_RANGE_MPS)
         self.emergency_burn_range_kms = tuple(self._mps_to_kms(v) for v in EMERGENCY_BURN_RANGE_MPS)
@@ -182,7 +198,7 @@ class ManeuverEngine:
                 reason=f"Delta-V {dv_magnitude:.4f} exceeds max {self.max_delta_v:.4f}",
             )
 
-        fuel_needed = self._compute_fuel_required(dv_magnitude)
+        fuel_needed = self._compute_fuel_required(dv_magnitude, current_fuel_kg=float(fuel_available))
         if fuel_needed > float(fuel_available) + 1e-12:
             return ManeuverResult(
                 new_position=position.copy(),
@@ -237,9 +253,35 @@ class ManeuverEngine:
             return np.array([0.0, 0.0, 1.0], dtype=np.float64)
         return np.zeros(3, dtype=np.float64)
 
-    def _compute_fuel_required(self, delta_v_magnitude: float) -> float:
-        """Compute fuel required for a maneuver."""
-        return float(self.fuel_factor * float(delta_v_magnitude))
+    def _compute_fuel_required(
+        self,
+        delta_v_magnitude: float,
+        current_fuel_kg: float = 100.0,
+    ) -> float:
+        """
+        Compute fuel required for a maneuver.
+
+        Phase 1 upgrade: uses the Tsiolkovsky rocket equation when
+        use_tsiolkovsky=True (default).
+
+            fuel_consumed = m_wet × (1 − exp(−ΔV / (Isp × g₀)))
+
+        where m_wet = dry_mass + current_fuel (current total satellite mass).
+
+        Falls back to the original linear model (1000 × ΔV) when
+        use_tsiolkovsky=False for backward compatibility.
+        """
+        dv = float(delta_v_magnitude)
+        if dv < 1e-15:
+            return 0.0
+
+        if self.use_tsiolkovsky:
+            m_wet = self.sat_dry_mass_kg + max(float(current_fuel_kg), 0.0)
+            # Tsiolkovsky: fuel = m_wet × (1 - exp(-ΔV / v_e))
+            fuel = m_wet * (1.0 - float(np.exp(-dv / ISP_G0_KMS)))
+            return float(np.clip(fuel, 0.0, float(current_fuel_kg)))
+        else:
+            return float(self.fuel_factor * dv)
 
     def get_discrete_action_space(self) -> Dict[int, ManeuverType]:
         """Get the mapping of action indices to maneuver types."""
